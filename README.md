@@ -1,41 +1,36 @@
-# discord-lite
+<div align="center">
 
-Cliente de Discord **nativo y ultraligero** para uso personal, escrito en Rust.
-Reemplaza al cliente oficial (Electron, ~300 MB) por algo que **arranca en ~22 MB
-de RAM** y pesa **~3 MB** en un único ejecutable de doble clic.
+<img src="IconoM.png" width="160" alt="Logo de Discord Lite"/>
 
-> Diseño y alcance: ver [`spec.md`](spec.md), [`plan.md`](plan.md) y
-> [`tasks.md`](tasks.md).
+# Discord Lite
 
-## Estado actual
+**Cliente de Discord nativo y ultraligero, escrito en Rust.**
 
-**Fase 1 — Texto: funcional.**
+Texto + voz en un único `.exe` de doble clic: **~3 MB** de tamaño y **~22 MB de RAM**,
+frente a los ~300 MB del cliente oficial (Electron).
 
-- [x] Autenticación por **token de usuario** con almacenamiento seguro
-      (Windows Credential Manager vía `keyring`; fallback a archivo restringido).
-- [x] Pantalla de **login** con validación del token contra la API.
-- [x] **Gateway** en tiempo real: HELLO → IDENTIFY, heartbeat con vigilancia de
-      ACK, `MESSAGE_CREATE`, y **reconexión automática** con RESUME/backoff.
-- [x] **REST**: historial de canal/DM, envío de mensajes, listar guilds/canales/DMs,
-      abrir DM, con manejo de **rate limits (429)**.
-- [x] **GUI FLTK**: lista de canales seguidos, vista de mensajes en vivo, caja de
-      envío, indicador de estado de conexión, alta de canales y logout.
-- [x] **Config** persistente (canales seguidos, último canal).
+[![Release](https://img.shields.io/github/v/release/BetoCW/Discord-BuildInRust?label=Release&color=brightgreen)](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
+[![Descargas](https://img.shields.io/github/downloads/BetoCW/Discord-BuildInRust/total?label=Descargas&color=blue)](https://github.com/BetoCW/Discord-BuildInRust/releases)
+[![Rust](https://img.shields.io/badge/Rust-stable--gnu-orange?logo=rust)](https://www.rust-lang.org/)
+[![Licencia](https://img.shields.io/badge/Licencia-MIT%20%7C%20Apache--2.0-lightgrey)](#licencia)
 
-**Fase 2 — Voz: implementada, pendiente de prueba en vivo.**
+### [⬇️ Descargar la última versión](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
 
-- [x] Señalización (Voice State Update op 4) y captura de
-      `VOICE_STATE_UPDATE`/`VOICE_SERVER_UPDATE`.
-- [x] **Voice Gateway** (WebSocket aparte): IDENTIFY → READY → SELECT PROTOCOL →
-      SESSION DESCRIPTION, con heartbeat propio.
-- [x] **UDP + IP discovery** y cifrado **XChaCha20-Poly1305 (rtpsize)**.
-- [x] **Opus** (encode/decode) y audio dúplex con **cpal** (captura + reproducción).
-- [x] Controles en la GUI: unirse/salir, **mute** y **deaf**.
-- [ ] **Verificación en vivo** con un canal de voz real y un segundo participante.
-- [ ] Reconexión automática del Voice Gateway (v1 hace un único intento).
+*Descarga `discord-lite.exe`, haz doble clic y listo. No requiere instalación.*
 
-> ⚠️ La voz con token de usuario es la parte de **mayor riesgo de baneo**
-> (self-bot). Úsala con criterio.
+</div>
+
+---
+
+## ✨ Características
+
+| | |
+|---|---|
+| 💬 **Texto en tiempo real** | Historial, envío de mensajes, DMs y canales de servidores, con reconexión automática y manejo de rate limits. |
+| 🎙️ **Voz** | Unirse a canales de voz con audio dúplex (Opus + cifrado XChaCha20-Poly1305), controles de mute/deaf. |
+| 🔐 **Token seguro** | Se guarda en el Credential Manager de Windows; nunca en texto plano. |
+| 📥 **Importación automática** | Puede leer el token de tu Discord oficial instalado (tu propia cuenta) sin pegarlo a mano. |
+| 🪶 **Ultraligero** | GUI nativa (FLTK), sin Electron ni navegador embebido. Un solo ejecutable autónomo. |
 
 ## ⚠️ Aviso importante (ToS)
 
@@ -44,10 +39,63 @@ Servicio de Discord (se considera *self-bot*) y **puede causar el baneo de la
 cuenta**. Este proyecto es para **uso personal, de bajo volumen y a ritmo
 humano**. El token da acceso total a la cuenta: trátalo como secreto crítico.
 
-## Requisitos de compilación (Windows)
+> La voz con token de usuario es la parte de **mayor riesgo de baneo**. Úsala con criterio.
 
-El proyecto usa el **toolchain GNU de Rust** (no requiere Visual Studio). Para
-compilarlo se instaló:
+## 🚀 Primer uso
+
+1. Descarga `discord-lite.exe` desde [Releases](https://github.com/BetoCW/Discord-BuildInRust/releases/latest) y ábrelo con doble clic.
+2. En la pantalla de login tienes dos opciones:
+   - **Pega tu token de usuario** y pulsa *Entrar*. Se valida contra la API y se
+     guarda de forma segura; no tendrás que volver a introducirlo.
+   - Pulsa **"Importar de Discord (cuenta propia)"** para leerlo automáticamente
+     del Discord oficial instalado en tu PC.
+3. Añade canales por **ID** en el panel izquierdo (*"Seguir canal"*).
+4. Selecciona un canal para ver su historial y los mensajes en vivo; escribe y
+   pulsa Enter o *"Enviar"*.
+
+> 💡 Para obtener IDs en Discord: activa *Ajustes → Avanzado → Modo desarrollador*,
+> y luego clic derecho sobre el servidor/canal → *Copiar ID*.
+
+### 🎙️ Voz
+
+En el panel izquierdo, sección **Voz**: introduce el **ID del servidor (guild)** y
+el **ID del canal de voz**, y pulsa **"Unirse a voz"**. Usa **Mic** y **Salida**
+para silenciar entrada/salida, y **"Salir de voz"** para colgar.
+
+### 📂 Dónde se guardan los datos
+
+- **Token**: Windows Credential Manager (servicio `discord-lite`), o
+  `…\discord-lite\config\token.secret` con permisos restringidos como fallback.
+- **Config**: `…\discord-lite\config\config.json` (canales seguidos, último canal).
+
+Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token guardado).
+
+## 📊 Estado del proyecto
+
+**Fase 1 — Texto: ✅ funcional.**
+
+- [x] Autenticación por token con almacenamiento seguro (keyring / Credential Manager).
+- [x] Gateway en tiempo real: heartbeat con vigilancia de ACK, `MESSAGE_CREATE`,
+      reconexión automática con RESUME/backoff.
+- [x] REST: historial, envío, listar guilds/canales/DMs, abrir DM, rate limits (429).
+- [x] GUI FLTK: canales seguidos, mensajes en vivo, estado de conexión, logout.
+
+**Fase 2 — Voz: ⚙️ implementada, pendiente de prueba en vivo.**
+
+- [x] Señalización + Voice Gateway (IDENTIFY → READY → SELECT PROTOCOL → SESSION DESCRIPTION).
+- [x] UDP + IP discovery, cifrado XChaCha20-Poly1305 (rtpsize).
+- [x] Opus (encode/decode) y audio dúplex con cpal; controles mute/deaf en la GUI.
+- [ ] Verificación en vivo con un canal de voz real y un segundo participante.
+- [ ] Reconexión automática del Voice Gateway (v1 hace un único intento).
+
+> Diseño y alcance detallados: [`spec.md`](spec.md) · [`plan.md`](plan.md) · [`tasks.md`](tasks.md)
+
+## 🛠️ Compilar desde el código fuente
+
+<details>
+<summary><b>Requisitos e instrucciones (Windows)</b> — solo si no quieres usar el .exe de Releases</summary>
+
+El proyecto usa el **toolchain GNU de Rust** (no requiere Visual Studio):
 
 1. **Rust (toolchain GNU)** — `stable-x86_64-pc-windows-gnu`.
    Instalado con `rustup-init.exe --default-host x86_64-pc-windows-gnu`.
@@ -56,21 +104,14 @@ compilarlo se instaló:
    Necesario para `dlltool` (import libs de `windows-sys`) y para compilar FLTK.
 3. **CMake** — `winget install Kitware.CMake` (lo usa `fltk` para construir FLTK).
 4. **libopus** (para la voz) — `audiopus_sys` no puede construir Opus con el
-   toolchain GNU (necesita autotools/sh). Por eso se compiló **libopus.a** con
-   mingw y se enlaza desde `thirdparty/opus-lib/`, configurado vía
-   `.cargo/config.toml` (`OPUS_LIB_DIR`, `OPUS_STATIC`, `OPUS_NO_PKG`).
-   Para regenerarla: descargar Opus 1.5.x, `cmake -G "MinGW Makefiles"
-   -DOPUS_BUILD_SHARED_LIBRARY=OFF`, `cmake --build`, y copiar `libopus.a` a
-   `thirdparty/opus-lib/`.
+   toolchain GNU. Por eso se compiló **libopus.a** con mingw y se enlaza desde
+   `thirdparty/opus-lib/`, configurado vía `.cargo/config.toml`
+   (`OPUS_LIB_DIR`, `OPUS_STATIC`, `OPUS_NO_PKG`). Para regenerarla: descargar
+   Opus 1.5.x, `cmake -G "MinGW Makefiles" -DOPUS_BUILD_SHARED_LIBRARY=OFF`,
+   `cmake --build`, y copiar `libopus.a` a `thirdparty/opus-lib/`.
 
 > TLS: se usa **native-tls = SChannel** (Windows), por lo que **no** hace falta
-> OpenSSL ni rustls/ring (que requerirían más herramientas de C).
-
-Asegúrate de que estén en el `PATH` (el instalador de Rust y winget normalmente
-lo hacen). El `bin` de mingw es algo como:
-`%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.MSVCRT_*\mingw64\bin`
-
-## Compilar
+> OpenSSL ni rustls/ring.
 
 ```powershell
 # Debug (con consola para ver logs)
@@ -84,61 +125,13 @@ cargo build --release
 El perfil `release` usa `opt-level="z"`, `lto`, `strip` y `panic="abort"`, y marca
 la app como subsistema *windows* (sin ventana de consola al hacer doble clic).
 
-## Lanzador en el escritorio
-
 El icono de la app (`icon.png` → `icon.ico`) se **incrusta en el `.exe`** mediante
 `build.rs` (compilado con `windres`). El ejecutable es **autónomo** (solo depende
 de DLLs del sistema de Windows).
 
-Para (re)crear el acceso directo del escritorio: se copia el release a
-`dist\discord-lite.exe` y se genera `Discord Lite.lnk` en el escritorio apuntando
-ahí, con el icono. (Hecho con un script PowerShell de `WScript.Shell`.)
+</details>
 
-## Primer uso
-
-1. Ejecuta `discord-lite.exe` (doble clic).
-2. En la pantalla de login, **pega tu token de usuario** y pulsa *Entrar*.
-   - Se valida contra la API y, si es correcto, se **guarda de forma segura**;
-     no tendrás que volver a introducirlo.
-   - Alternativa para la primera vez: define `DISCORD_TOKEN` en el entorno antes
-     de abrir la app y se guardará automáticamente.
-3. Añade canales por **ID** en el panel izquierdo ("Seguir canal").
-4. Selecciona un canal para ver su historial y los mensajes en vivo; escribe y
-   pulsa Enter o "Enviar".
-
-### Voz
-
-En el panel izquierdo, sección **Voz**: introduce el **ID del servidor (guild)** y
-el **ID del canal de voz**, y pulsa **"Unirse a voz"**. Usa **Mic** y **Salida**
-para silenciar entrada/salida, y **"Salir de voz"** para colgar.
-
-> Para obtener IDs en Discord: activa *Ajustes → Avanzado → Modo desarrollador*,
-> y luego clic derecho sobre el servidor/canal → *Copiar ID*.
-
-### Importar el token automáticamente
-
-En vez de pegar el token, puedes pulsar **"Importar de Discord (cuenta propia)"**:
-lee el token de tu Discord oficial instalado (descifrando con tu sesión de
-Windows), lo valida y entra. Diagnóstico sin exponer el token:
-`discord-lite.exe --check-import`.
-
-## Dónde se guardan los datos
-
-- **Token**: Windows Credential Manager (servicio `discord-lite`), o
-  `…\discord-lite\config\token.secret` con permisos restringidos como fallback.
-- **Config**: `…\discord-lite\config\config.json` (canales seguidos, último canal).
-  Rutas exactas según `directories` (`%APPDATA%` en Windows).
-
-Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token).
-
-## Empaquetado por SO
-
-- **Windows** (objetivo principal): `cargo build --release` → `discord-lite.exe`
-  autocontenido (TLS por SChannel del sistema, FLTK enlazado estático).
-- **Linux** (best-effort, pendiente de probar): `cargo build --release` → ELF;
-  empaquetar como AppImage. La voz (fase 2) requerirá empaquetar `libopus`.
-
-## Estructura del código
+## 🧩 Estructura del código
 
 | Módulo | Responsabilidad |
 |--------|-----------------|
@@ -147,6 +140,11 @@ Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token).
 | `config` | Preferencias persistentes (no secretas). |
 | `rest` | Cliente REST (historial, envío, listas, rate limits). |
 | `gateway` | WebSocket en tiempo real (heartbeat, dispatch, reconexión). |
+| `voice` / `dave` | Voz: Voice Gateway, UDP, cifrado, Opus, audio. |
 | `net` | Orquestador async: REST + Gateway + comandos de la UI. |
 | `state` | `Command`/`AppEvent` y estado central de la app. |
 | `ui` | GUI FLTK (login + ventana principal). |
+
+## 📜 Licencia
+
+MIT OR Apache-2.0
