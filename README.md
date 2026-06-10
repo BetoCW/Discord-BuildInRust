@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="IconoM.png" width="160" alt="Logo de Discord Lite"/>
+<img src="icon.png" width="160" alt="Logo de Discord Lite"/>
 
 # Discord Lite
 
 **Cliente de Discord nativo y ultraligero, escrito en Rust.**
 
-Texto + voz en un único `.exe` de doble clic: **~3 MB** de tamaño y **~22 MB de RAM**,
+Texto + voz (con E2EE) en una app nativa: **~6 MB** instalados y **~22 MB de RAM**,
 frente a los ~300 MB del cliente oficial (Electron).
 
 [![Release](https://img.shields.io/github/v/release/BetoCW/Discord-BuildInRust?label=Release&color=brightgreen)](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
@@ -16,7 +16,8 @@ frente a los ~300 MB del cliente oficial (Electron).
 
 ### [⬇️ Descargar la última versión](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
 
-*Descarga `discord-lite.exe`, haz doble clic y listo. No requiere instalación.*
+*Recomendado: `discord-lite-setup-x.y.z.exe` (instalador con accesos directos y desinstalador).*
+*También hay `discord-lite.exe` portable: doble clic y listo, sin instalación.*
 
 </div>
 
@@ -27,7 +28,8 @@ frente a los ~300 MB del cliente oficial (Electron).
 | | |
 |---|---|
 | 💬 **Texto en tiempo real** | Historial, envío de mensajes, DMs y canales de servidores, con reconexión automática y manejo de rate limits. |
-| 🎙️ **Voz** | Unirse a canales de voz con audio dúplex (Opus + cifrado XChaCha20-Poly1305), controles de mute/deaf. |
+| 🎙️ **Voz funcional** | Canales de voz con audio dúplex (Opus + XChaCha20-Poly1305) y **cifrado de extremo a extremo DAVE/MLS**, interoperando con clientes oficiales. Probado en vivo. |
+| 🎛️ **Ajustes de voz** | Panel estilo Discord: elegir micrófono/altavoces, volúmenes 0–200 %, prueba de micrófono con medidor, sensibilidad de entrada, **cancelación de eco**, supresión de ruido y ganancia automática. Todo se aplica en vivo, incluso en plena llamada. |
 | 🔐 **Token seguro** | Se guarda en el Credential Manager de Windows; nunca en texto plano. |
 | 📥 **Importación automática** | Puede leer el token de tu Discord oficial instalado (tu propia cuenta) sin pegarlo a mano. |
 | 🪶 **Ultraligero** | GUI nativa (FLTK), sin Electron ni navegador embebido. Un solo ejecutable autónomo. |
@@ -43,7 +45,8 @@ humano**. El token da acceso total a la cuenta: trátalo como secreto crítico.
 
 ## 🚀 Primer uso
 
-1. Descarga `discord-lite.exe` desde [Releases](https://github.com/BetoCW/Discord-BuildInRust/releases/latest) y ábrelo con doble clic.
+1. Descarga el **instalador** desde [Releases](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
+   y síguelo (no pide administrador). O usa el `.exe` portable si lo prefieres.
 2. En la pantalla de login tienes dos opciones:
    - **Pega tu token de usuario** y pulsa *Entrar*. Se valida contra la API y se
      guarda de forma segura; no tendrás que volver a introducirlo.
@@ -58,15 +61,27 @@ humano**. El token da acceso total a la cuenta: trátalo como secreto crítico.
 
 ### 🎙️ Voz
 
-En el panel izquierdo, sección **Voz**: introduce el **ID del servidor (guild)** y
-el **ID del canal de voz**, y pulsa **"Unirse a voz"**. Usa **Mic** y **Salida**
-para silenciar entrada/salida, y **"Salir de voz"** para colgar.
+- **Unirse**: doble clic en un canal 🔊 de tu lista, o botón **"🔊 Reunirse al
+  último"** (recuerda el último canal usado). En modo avanzado puedes introducir
+  los IDs de servidor y canal a mano.
+- **Controles**: **Mic** y **Salida** para silenciar entrada/salida, y
+  **"Salir de voz"** para colgar.
+- **⚙ Ajustes de voz**: elige dispositivos, ajusta volúmenes y haz la **prueba
+  de micrófono** antes de entrar. Si tus amigos oyen eco, deja activada la
+  *cancelación de eco* (o mejor: usa auriculares); si te oyen bajo, el *control
+  de ganancia automático* lo corrige.
+
+> 🎤 **¿No te oyen?** Comprueba el permiso de micrófono de Windows:
+> *Configuración → Privacidad y seguridad → Micrófono → "Permitir que las
+> aplicaciones de escritorio accedan al micrófono"*. El instalador ofrece abrir
+> esa página al terminar.
 
 ### 📂 Dónde se guardan los datos
 
 - **Token**: Windows Credential Manager (servicio `discord-lite`), o
   `…\discord-lite\config\token.secret` con permisos restringidos como fallback.
-- **Config**: `…\discord-lite\config\config.json` (canales seguidos, último canal).
+- **Config**: `…\discord-lite\config\config.json` (canales seguidos, último
+  canal, ajustes de voz).
 
 Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token guardado).
 
@@ -80,20 +95,23 @@ Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token guardado)
 - [x] REST: historial, envío, listar guilds/canales/DMs, abrir DM, rate limits (429).
 - [x] GUI FLTK: canales seguidos, mensajes en vivo, estado de conexión, logout.
 
-**Fase 2 — Voz: ⚙️ implementada, pendiente de prueba en vivo.**
+**Fase 2 — Voz: ✅ funcional (verificada en vivo con clientes oficiales).**
 
-- [x] Señalización + Voice Gateway (IDENTIFY → READY → SELECT PROTOCOL → SESSION DESCRIPTION).
-- [x] UDP + IP discovery, cifrado XChaCha20-Poly1305 (rtpsize).
-- [x] Opus (encode/decode) y audio dúplex con cpal; controles mute/deaf en la GUI.
-- [ ] Verificación en vivo con un canal de voz real y un segundo participante.
-- [ ] Reconexión automática del Voice Gateway (v1 hace un único intento).
+- [x] Señalización + Voice Gateway v8 (IDENTIFY → READY → SELECT PROTOCOL → SESSION DESCRIPTION).
+- [x] UDP + IP discovery, cifrado de transporte XChaCha20-Poly1305 (rtpsize).
+- [x] **E2EE DAVE** (MLS RFC 9420): handshake completo, claves por participante,
+      rotación de epoch al entrar/salir gente y downgrade negociado.
+- [x] Opus (encode/decode) y audio dúplex con cpal; mute/deaf en la GUI.
+- [x] Panel de **Ajustes de voz**: dispositivos (con cambio en caliente),
+      volúmenes, prueba de mic, sensibilidad, anti-eco, supresión de ruido y AGC.
+- [ ] Reconexión automática del Voice Gateway (hoy hace un único intento).
 
 > Diseño y alcance detallados: [`spec.md`](spec.md) · [`plan.md`](plan.md) · [`tasks.md`](tasks.md)
 
 ## 🛠️ Compilar desde el código fuente
 
 <details>
-<summary><b>Requisitos e instrucciones (Windows)</b> — solo si no quieres usar el .exe de Releases</summary>
+<summary><b>Requisitos e instrucciones (Windows)</b> — solo si no quieres usar el instalador de Releases</summary>
 
 El proyecto usa el **toolchain GNU de Rust** (no requiere Visual Studio):
 
@@ -119,7 +137,11 @@ cargo build
 
 # Release (sin consola, optimizado para tamaño/RAM → el .exe de doble clic)
 cargo build --release
-# Resultado: target\release\discord-lite.exe   (~3 MB)
+# Resultado: target\release\discord-lite.exe
+
+# Instalador (requiere Inno Setup 6: winget install JRSoftware.InnoSetup)
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\discord-lite.iss
+# Resultado: dist\discord-lite-setup-<versión>.exe
 ```
 
 El perfil `release` usa `opt-level="z"`, `lto`, `strip` y `panic="abort"`, y marca
@@ -137,13 +159,14 @@ de DLLs del sistema de Windows).
 |--------|-----------------|
 | `model` | Tipos serde (REST + Gateway), tolerantes a cambios de API. |
 | `auth` | Token seguro (keyring + fallback), redacción en logs. |
-| `config` | Preferencias persistentes (no secretas). |
+| `config` | Preferencias persistentes (no secretas), incl. ajustes de voz. |
 | `rest` | Cliente REST (historial, envío, listas, rate limits). |
 | `gateway` | WebSocket en tiempo real (heartbeat, dispatch, reconexión). |
-| `voice` / `dave` | Voz: Voice Gateway, UDP, cifrado, Opus, audio. |
+| `voice` / `dave` | Voz: Voice Gateway, UDP, cifrado de transporte y E2EE (MLS), Opus. |
+| `audio` | Dispositivos y procesado de mic (anti-eco, ruido, AGC) + prueba de mic. |
 | `net` | Orquestador async: REST + Gateway + comandos de la UI. |
 | `state` | `Command`/`AppEvent` y estado central de la app. |
-| `ui` | GUI FLTK (login + ventana principal). |
+| `ui` | GUI FLTK (login, ventana principal, Ajustes de voz). |
 
 ## 📜 Licencia
 
