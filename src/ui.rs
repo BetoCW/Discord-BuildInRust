@@ -88,6 +88,8 @@ pub fn run(rt: Runtime) -> Result<()> {
         tracing::info!("purgadas {} entradas inválidas de canales", before - cfg.followed_channels.len());
     }
     let history_limit = cfg.history_limit;
+    // Vuelca los ajustes de voz persistidos a las opciones en vivo del audio.
+    crate::audio::apply_settings(&cfg.voice);
 
     // --- Canales entre UI y red --------------------------------------------
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
@@ -168,6 +170,8 @@ pub fn run(rt: Runtime) -> Result<()> {
     }
     let mut mute_btn = button::Button::default().with_label("🎙 Mic: ON");
     let mut deaf_btn = button::Button::default().with_label("🔊 Salida: ON");
+    let mut voice_cfg_btn = button::Button::default().with_label("⚙ Ajustes de voz");
+    voice_cfg_btn.set_tooltip("Micrófono, altavoces, volúmenes, prueba de mic y anti-eco");
     let mut voice_status = frame::Frame::default().with_label("voz: inactiva");
     voice_status.set_align(Align::Left | Align::Inside | Align::Wrap);
     voice_status.set_label_size(11);
@@ -193,6 +197,7 @@ pub fn run(rt: Runtime) -> Result<()> {
     left.fixed(&vchan_in, 24);
     left.fixed(&mute_btn, 26);
     left.fixed(&deaf_btn, 26);
+    left.fixed(&voice_cfg_btn, 26);
     left.fixed(&voice_status, 32);
     left.fixed(&info_btn, 24);
     left.fixed(&log_btn, 24);
@@ -693,6 +698,18 @@ pub fn run(rt: Runtime) -> Result<()> {
             let _ = cmd_tx.send(Command::VoiceDeaf(d));
         });
     }
+    // Ventana de «Ajustes de voz» (estilo Discord). Guard para no abrir dos.
+    {
+        let ui = ui.clone();
+        let open = Rc::new(Cell::new(false));
+        voice_cfg_btn.set_callback(move |_| {
+            if open.get() {
+                return;
+            }
+            open.set(true);
+            open_voice_settings(&ui, open.clone());
+        });
+    }
 
     // --- Bucle principal de la GUI -----------------------------------------
     // Auto-unión a voz para pruebas: DISCORD_LITE_AUTOJOIN="guild:channel".
@@ -941,6 +958,362 @@ fn style_header(f: &mut frame::Frame) {
     f.set_label_color(Color::from_rgb(140, 160, 220));
     f.set_label_size(12);
     f.set_align(Align::Left | Align::Inside);
+}
+
+// --- Ajustes de voz (panel estilo Discord) -----------------------------------
+
+/// Encabezado de sección del panel de ajustes (mayúsculas grises pequeñas,
+/// como las secciones de «Voz y vídeo» de Discord).
+fn settings_header(title: &str) -> frame::Frame {
+    let mut h = frame::Frame::default().with_label(title);
+    h.set_label_size(11);
+    h.set_label_color(Color::from_rgb(181, 186, 193));
+    h.set_align(Align::Left | Align::Inside);
+    h
+}
+
+/// Escapa los metacaracteres de los menús FLTK ('/', '_', '&', '\\' crean
+/// submenús/atajos) para mostrar nombres de dispositivo literales.
+fn menu_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('/', "\\/")
+        .replace('_', "\\_")
+        .replace('&', "\\&")
+        .replace('|', "¦")
+}
+
+/// Desplegable de dispositivos: «Predeterminado» + los nombres detectados,
+/// preseleccionando el guardado en config (si sigue existiendo).
+fn device_choice(names: &[String], current: &Option<String>) -> menu::Choice {
+    let mut c = menu::Choice::default();
+    c.set_color(Color::from_rgb(30, 31, 34));
+    c.add_choice("Predeterminado");
+    for n in names {
+        c.add_choice(&menu_escape(n));
+    }
+    let idx = current
+        .as_ref()
+        .and_then(|cur| names.iter().position(|n| n == cur))
+        .map(|i| i as i32 + 1)
+        .unwrap_or(0);
+    c.set_value(idx);
+    c
+}
+
+/// Slider horizontal con el valor visible (volúmenes y sensibilidad).
+fn settings_slider(min: f64, max: f64, value: f64) -> valuator::HorValueSlider {
+    let mut s = valuator::HorValueSlider::default();
+    s.set_bounds(min, max);
+    s.set_step(1.0, 1);
+    s.set_value(value);
+    s.set_color(Color::from_rgb(30, 31, 34));
+    s.set_selection_color(Color::from_rgb(88, 101, 242));
+    s.set_text_size(10);
+    s.set_text_color(Color::from_rgb(223, 226, 230));
+    s
+}
+
+/// Ventana «Ajustes de voz» (réplica del panel Voz y vídeo de Discord):
+/// dispositivos de entrada/salida, volúmenes, «Probemos el micrófono» con
+/// medidor en vivo, sensibilidad de entrada y procesamiento de voz
+/// (cancelación de eco, supresión de ruido, control de ganancia automático).
+/// Todos los cambios se aplican EN VIVO —también en mitad de una llamada— y se
+/// persisten en la config.
+fn open_voice_settings(ui: &Rc<RefCell<UiState>>, open_flag: Rc<Cell<bool>>) {
+    use crate::audio;
+    use std::sync::atomic::Ordering;
+
+    let accent = Color::from_rgb(88, 101, 242); // blurple Discord
+    let green = Color::from_rgb(35, 165, 89); // verde del medidor de Discord
+    let red = Color::from_rgb(218, 55, 60);
+    let v = ui.borrow().cfg.voice.clone();
+    let in_names = audio::input_device_names();
+    let out_names = audio::output_device_names();
+
+    let mut win = window::Window::default()
+        .with_size(620, 600)
+        .with_label("Ajustes de voz");
+    win.set_color(Color::from_rgb(49, 51, 56)); // panel central Discord #313338
+
+    let mut col = group::Flex::default_fill().column();
+    col.set_margin(20);
+    col.set_pad(8);
+
+    // --- Dispositivos (entrada / salida en dos columnas) --------------------
+    let mut dev_row = group::Flex::default().row();
+    dev_row.set_pad(16);
+    let in_choice = {
+        let mut c = group::Flex::default().column();
+        c.set_pad(4);
+        let h = settings_header("DISPOSITIVO DE ENTRADA");
+        c.fixed(&h, 16);
+        let ch = device_choice(&in_names, &v.input_device);
+        c.fixed(&ch, 28);
+        c.end();
+        ch
+    };
+    let out_choice = {
+        let mut c = group::Flex::default().column();
+        c.set_pad(4);
+        let h = settings_header("DISPOSITIVO DE SALIDA");
+        c.fixed(&h, 16);
+        let ch = device_choice(&out_names, &v.output_device);
+        c.fixed(&ch, 28);
+        c.end();
+        ch
+    };
+    dev_row.end();
+    col.fixed(&dev_row, 52);
+
+    // --- Volúmenes -----------------------------------------------------------
+    let mut vol_row = group::Flex::default().row();
+    vol_row.set_pad(16);
+    let in_vol = {
+        let mut c = group::Flex::default().column();
+        c.set_pad(4);
+        let h = settings_header("VOLUMEN DE ENTRADA (%)");
+        c.fixed(&h, 16);
+        let s = settings_slider(0.0, 200.0, v.input_volume as f64);
+        c.fixed(&s, 26);
+        c.end();
+        s
+    };
+    let out_vol = {
+        let mut c = group::Flex::default().column();
+        c.set_pad(4);
+        let h = settings_header("VOLUMEN DE SALIDA (%)");
+        c.fixed(&h, 16);
+        let s = settings_slider(0.0, 200.0, v.output_volume as f64);
+        c.fixed(&s, 26);
+        c.end();
+        s
+    };
+    vol_row.end();
+    col.fixed(&vol_row, 50);
+
+    // --- Prueba de micrófono -------------------------------------------------
+    let h = settings_header("PROBEMOS EL MICRÓFONO");
+    col.fixed(&h, 18);
+    let mut test_hint = frame::Frame::default().with_label(
+        "¿Tienes problemas de voz? Inicia una prueba y di algo divertido: \
+         te lo reproduciremos por la salida elegida.",
+    );
+    test_hint.set_label_size(11);
+    test_hint.set_label_color(Color::from_rgb(181, 186, 193));
+    test_hint.set_align(Align::Left | Align::Inside | Align::Wrap);
+    col.fixed(&test_hint, 28);
+    let mut test_row = group::Flex::default().row();
+    test_row.set_pad(12);
+    let mut mic_btn = button::Button::default().with_label("Probemos");
+    mic_btn.set_color(accent);
+    mic_btn.set_label_color(Color::White);
+    test_row.fixed(&mic_btn, 140);
+    let mut meter = misc::Progress::default();
+    meter.set_minimum(0.0);
+    meter.set_maximum(100.0);
+    meter.set_value(0.0);
+    meter.set_frame(FrameType::FlatBox);
+    meter.set_color(Color::from_rgb(30, 31, 34));
+    meter.set_selection_color(green);
+    test_row.end();
+    col.fixed(&test_row, 30);
+
+    // --- Sensibilidad de entrada ----------------------------------------------
+    let h = settings_header("SENSIBILIDAD DE ENTRADA");
+    col.fixed(&h, 18);
+    let mut auto_chk = button::CheckButton::default()
+        .with_label("Determinar automáticamente la sensibilidad de entrada");
+    auto_chk.set_value(v.auto_sensitivity);
+    col.fixed(&auto_chk, 22);
+    let mut sens = settings_slider(-100.0, 0.0, v.sensitivity_db as f64);
+    sens.set_tooltip("Umbral en dB: el micrófono solo transmite por encima de este nivel");
+    if v.auto_sensitivity {
+        sens.deactivate();
+    }
+    col.fixed(&sens, 26);
+
+    // --- Procesamiento de voz ---------------------------------------------------
+    let h = settings_header("PROCESAMIENTO DE VOZ");
+    col.fixed(&h, 18);
+    let mut echo_chk = button::CheckButton::default().with_label("Cancelación de eco");
+    echo_chk.set_tooltip("Atenúa tu micrófono mientras suena la voz de otros (evita que les vuelva su propia voz)");
+    echo_chk.set_value(v.echo_suppression);
+    col.fixed(&echo_chk, 22);
+    let mut noise_chk = button::CheckButton::default().with_label("Supresión de ruido");
+    noise_chk.set_tooltip("Silencia el ruido de fondo del micrófono cuando no hablas");
+    noise_chk.set_value(v.noise_suppression);
+    col.fixed(&noise_chk, 22);
+    let mut agc_chk =
+        button::CheckButton::default().with_label("Control de ganancia automático");
+    agc_chk.set_tooltip("Sube automáticamente el volumen si tu voz se oye baja");
+    agc_chk.set_value(v.auto_gain);
+    col.fixed(&agc_chk, 22);
+
+    // Pie con consejos (elemento flexible: ocupa lo que sobra).
+    let mut foot = frame::Frame::default().with_label(
+        "Los cambios se aplican al instante, incluso en plena llamada.\n\
+         Consejo anti-eco: usa auriculares. Sin ellos, deja activada la \
+         cancelación de eco para que tus amigos no se oigan a sí mismos.",
+    );
+    foot.set_label_size(11);
+    foot.set_label_color(Color::from_rgb(150, 152, 158));
+    foot.set_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+
+    col.end();
+    win.end();
+    win.make_resizable(false);
+    win.show();
+
+    // --- Callbacks: todo se aplica en vivo y se persiste ----------------------
+    {
+        let ui = ui.clone();
+        let names = in_names.clone();
+        let mut c = in_choice.clone();
+        c.set_callback(move |c| {
+            let idx = c.value();
+            let name = if idx <= 0 { None } else { names.get((idx - 1) as usize).cloned() };
+            audio::options().set_input_device(name.clone());
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.input_device = name;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        let names = out_names.clone();
+        let mut c = out_choice.clone();
+        c.set_callback(move |c| {
+            let idx = c.value();
+            let name = if idx <= 0 { None } else { names.get((idx - 1) as usize).cloned() };
+            audio::options().set_output_device(name.clone());
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.output_device = name;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        let mut s2 = in_vol.clone();
+        s2.set_callback(move |s| {
+            let val = s.value().round() as u32;
+            audio::options().set_input_volume(val);
+            let mut st = ui.borrow_mut();
+            st.cfg.voice.input_volume = val;
+            let _ = st.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        let mut s2 = out_vol.clone();
+        s2.set_callback(move |s| {
+            let val = s.value().round() as u32;
+            audio::options().set_output_volume(val);
+            let mut st = ui.borrow_mut();
+            st.cfg.voice.output_volume = val;
+            let _ = st.cfg.save();
+        });
+    }
+
+    // Prueba de micrófono: alterna captura→procesado→reproducción local.
+    let test: Rc<RefCell<Option<audio::MicTest>>> = Rc::new(RefCell::new(None));
+    {
+        let test = test.clone();
+        let mut meter2 = meter.clone();
+        mic_btn.set_callback(move |b| {
+            let mut t = test.borrow_mut();
+            if t.is_some() {
+                *t = None; // Drop detiene el hilo de la prueba
+                b.set_label("Probemos");
+                b.set_color(accent);
+                meter2.set_value(0.0);
+            } else {
+                *t = Some(audio::start_mic_test());
+                b.set_label("Deja de probar");
+                b.set_color(red);
+            }
+            b.redraw();
+        });
+    }
+    // Medidor en vivo (también se mueve durante una llamada real).
+    {
+        let win2 = win.clone();
+        let mut meter2 = meter.clone();
+        app::add_timeout3(0.06, move |h| {
+            if !win2.shown() {
+                return; // la ventana se cerró: dejar de repetir
+            }
+            meter2.set_value(audio::options().mic_level() as f64);
+            app::repeat_timeout3(0.06, h);
+        });
+    }
+
+    {
+        let ui = ui.clone();
+        let mut sens2 = sens.clone();
+        auto_chk.set_callback(move |c| {
+            let auto = c.value();
+            audio::options().auto_sensitivity.store(auto, Ordering::Relaxed);
+            if auto {
+                sens2.deactivate();
+            } else {
+                sens2.activate();
+            }
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.auto_sensitivity = auto;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        let mut s2 = sens.clone();
+        s2.set_callback(move |s| {
+            let db = s.value().round() as i32;
+            audio::options().set_sensitivity_db(db);
+            let mut st = ui.borrow_mut();
+            st.cfg.voice.sensitivity_db = db;
+            let _ = st.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        echo_chk.set_callback(move |c| {
+            let on = c.value();
+            audio::options().echo_suppress.store(on, Ordering::Relaxed);
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.echo_suppression = on;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        noise_chk.set_callback(move |c| {
+            let on = c.value();
+            audio::options().noise_suppress.store(on, Ordering::Relaxed);
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.noise_suppression = on;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        agc_chk.set_callback(move |c| {
+            let on = c.value();
+            audio::options().agc.store(on, Ordering::Relaxed);
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.auto_gain = on;
+            let _ = s.cfg.save();
+        });
+    }
+
+    // Cerrar la ventana detiene la prueba y libera el guard de apertura.
+    {
+        let test = test.clone();
+        win.set_callback(move |w| {
+            *test.borrow_mut() = None;
+            open_flag.set(false);
+            w.hide();
+        });
+    }
 }
 
 /// Pantalla de login: pide el token, lo valida contra la API y lo guarda.

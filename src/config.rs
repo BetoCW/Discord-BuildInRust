@@ -16,6 +16,55 @@ pub struct VoiceTarget {
     pub channel_id: String,
 }
 
+/// Ajustes de voz (panel «Ajustes de voz», estilo Discord). Se aplican en vivo
+/// vía `audio::options()` y se persisten aquí.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceSettings {
+    /// Dispositivo de entrada elegido (`None` = predeterminado del sistema).
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// Dispositivo de salida elegido.
+    #[serde(default)]
+    pub output_device: Option<String>,
+    /// Volumen de entrada en % (0–200; 100 = sin cambio).
+    #[serde(default = "default_volume")]
+    pub input_volume: u32,
+    /// Volumen de salida en % (0–200).
+    #[serde(default = "default_volume")]
+    pub output_volume: u32,
+    /// Cancelación de eco (atenúa el micro mientras suena la voz de otros).
+    #[serde(default = "default_true")]
+    pub echo_suppression: bool,
+    /// Supresión de ruido (puerta de ruido).
+    #[serde(default = "default_true")]
+    pub noise_suppression: bool,
+    /// Control automático de ganancia (sube los micros que se oyen bajos).
+    #[serde(default = "default_true")]
+    pub auto_gain: bool,
+    /// Sensibilidad de entrada automática.
+    #[serde(default = "default_true")]
+    pub auto_sensitivity: bool,
+    /// Umbral manual de sensibilidad en dBFS (-100..0), si no es automática.
+    #[serde(default = "default_sensitivity")]
+    pub sensitivity_db: i32,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            input_device: None,
+            output_device: None,
+            input_volume: default_volume(),
+            output_volume: default_volume(),
+            echo_suppression: true,
+            noise_suppression: true,
+            auto_gain: true,
+            auto_sensitivity: true,
+            sensitivity_db: default_sensitivity(),
+        }
+    }
+}
+
 /// Preferencias del usuario que sobreviven a reinicios (RF-2, RF-8).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -31,10 +80,25 @@ pub struct Config {
     /// Cuántos mensajes recientes conservar por canal en memoria (RNF-2).
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
+    /// Ajustes de voz (dispositivos, volúmenes, procesamiento).
+    #[serde(default)]
+    pub voice: VoiceSettings,
 }
 
 fn default_history_limit() -> usize {
     100
+}
+
+fn default_volume() -> u32 {
+    100
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_sensitivity() -> i32 {
+    -60
 }
 
 impl Config {

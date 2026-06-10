@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod applog;
+mod audio;
 mod auth;
 mod config;
 mod dave;

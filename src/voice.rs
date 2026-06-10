@@ -9,12 +9,13 @@
 //! ⚠️ Sin verificar contra un canal de voz real todavía; la lógica de protocolo
 //! sigue la documentación de Discord (Voice Gateway v4 + modo aead rtpsize).
 
+use crate::audio::{self, cap, CHANNELS, FRAME_LEN, FRAME_SAMPLES, SAMPLE_RATE};
 use crate::dave;
 use crate::state::{AppEvent, VoiceControl};
 use anyhow::{anyhow, bail, Context, Result};
 use audiopus::{
     coder::{Decoder, Encoder},
-    Application, Channels, SampleRate,
+    Application, Channels, SampleRate as OpusRate,
 };
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -29,12 +30,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: usize = 2;
-/// Muestras por canal en un frame de 20 ms a 48 kHz.
-const FRAME_SAMPLES: usize = 960;
-/// Muestras interleaved (estéreo) por frame.
-const FRAME_LEN: usize = FRAME_SAMPLES * CHANNELS;
 const PREFERRED_MODE: &str = "aead_xchacha20_poly1305_rtpsize";
 
 /// Datos necesarios para abrir una sesión de voz.
@@ -522,66 +517,20 @@ fn start_audio(
     Ok(())
 }
 
-/// Puerta de ruido (noise gate) adaptativa para suprimir el **ruido blanco/hiss**
-/// constante del micrófono cuando no se habla. Estima el piso de ruido a partir
-/// de las tramas silenciosas y abre la puerta solo cuando la energía (RMS) supera
-/// ese piso por un margen; con histéresis (abrir/cerrar distintos) y una
-/// envolvente de ganancia (ataque rápido, liberación lenta) para no producir
-/// clics ni cortar el final de las palabras. Durante el habla la puerta queda
-/// abierta y el audio pasa íntegro (el hiss queda enmascarado por la voz).
-struct NoiseGate {
-    gain: f32,        // ganancia actual aplicada (0..1), suavizada
-    hold: u32,        // tramas restantes manteniendo la puerta abierta
-    noise_floor: f64, // estimación del piso de ruido (RMS) aprendida
-}
-
-impl NoiseGate {
-    fn new() -> Self {
-        Self { gain: 0.0, hold: 0, noise_floor: 200.0 }
-    }
-
-    /// Procesa una trama PCM in situ, atenuándola si se considera ruido de fondo.
-    fn process(&mut self, pcm: &mut [i16]) {
-        // ~0.5 s de "mantener abierto" tras detectar voz (a 50 tramas/s).
-        const HOLD_FRAMES: u32 = 25;
-
-        // Energía RMS de la trama.
-        let mut sum = 0.0f64;
-        for &s in pcm.iter() {
-            let v = s as f64;
-            sum += v * v;
-        }
-        let rms = (sum / pcm.len().max(1) as f64).sqrt();
-
-        // Umbrales relativos al piso de ruido aprendido, con suelo mínimo absoluto
-        // (evita abrir con micrófonos muy silenciosos). Histéresis: una vez abierta
-        // basta menos energía para mantenerla, así no parpadea en pausas breves.
-        let open = (self.noise_floor * 4.0).max(300.0);
-        let close = (self.noise_floor * 2.5).max(180.0);
-        let want_open = if self.gain > 0.5 { rms > close } else { rms > open };
-
-        if want_open {
-            self.hold = HOLD_FRAMES;
-        } else {
-            if self.hold > 0 {
-                self.hold -= 1;
-            }
-            // Aprende el piso de ruido SOLO en silencio (puerta cerrada).
-            self.noise_floor = self.noise_floor * 0.99 + rms * 0.01;
-        }
-
-        let target = if self.hold > 0 { 1.0 } else { 0.0 };
-        let coeff = if target > self.gain { 0.6 } else { 0.04 }; // ataque > liberación
-        self.gain += (target - self.gain) * coeff;
-        if self.gain < 0.001 {
-            self.gain = 0.0;
-        }
-        if self.gain < 0.999 {
-            for s in pcm.iter_mut() {
-                *s = (*s as f32 * self.gain) as i16;
-            }
-        }
-    }
+/// Abre los streams de captura y reproducción según los dispositivos elegidos
+/// en «Ajustes de voz». La salida alimenta la envolvente del anti-eco
+/// (`track_env = true`): mientras suena la voz de otros, el TX atenúa el micro.
+fn open_call_streams(
+    mic_buf: &Arc<Mutex<VecDeque<i16>>>,
+    play_buf: &Arc<Mutex<VecDeque<i16>>>,
+    deaf: &Arc<AtomicBool>,
+) -> Result<(cpal::Stream, cpal::Stream)> {
+    use cpal::traits::StreamTrait;
+    let in_stream = audio::build_input_stream(mic_buf.clone())?;
+    let out_stream = audio::build_output_stream(play_buf.clone(), Some(deaf.clone()), true)?;
+    in_stream.play()?;
+    out_stream.play()?;
+    Ok((in_stream, out_stream))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,109 +548,16 @@ fn audio_thread(
     mic_buf: Arc<Mutex<VecDeque<i16>>>,
     play_buf: Arc<Mutex<VecDeque<i16>>>,
 ) -> Result<()> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    // Streams según los dispositivos elegidos en «Ajustes de voz». Si el usuario
+    // cambia de dispositivo (sube `generation`), se reabren EN VIVO sin cortar
+    // la llamada (ver el chequeo dentro del bucle TX).
+    let opts = audio::options();
+    let mut device_gen = opts.generation();
+    let mut streams = Some(open_call_streams(&mic_buf, &play_buf, &deaf)?);
 
-    let host = cpal::default_host();
-    let in_dev = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("sin micrófono por defecto"))?;
-    let out_dev = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("sin altavoz por defecto"))?;
-
-    let in_cfg = in_dev.default_input_config()?;
-    let out_cfg = out_dev.default_output_config()?;
-    let in_ch = in_cfg.channels() as usize;
-    let out_ch = out_cfg.channels() as usize;
-    tracing::info!(
-        "audio in: '{}' {} Hz, {} canales, {:?}",
-        in_dev.name().unwrap_or_else(|_| "?".into()),
-        in_cfg.sample_rate().0,
-        in_ch,
-        in_cfg.sample_format()
-    );
-    tracing::info!(
-        "audio out: '{}' {} Hz, {} canales, {:?}",
-        out_dev.name().unwrap_or_else(|_| "?".into()),
-        out_cfg.sample_rate().0,
-        out_ch,
-        out_cfg.sample_format()
-    );
-    if in_cfg.sample_rate().0 != SAMPLE_RATE || out_cfg.sample_rate().0 != SAMPLE_RATE {
-        tracing::warn!(
-            "⚠️ dispositivos NO están a 48 kHz (in={}, out={}) y NO hay remuestreo: \
-             el audio sonará a velocidad/tono incorrecto o no se entenderá",
-            in_cfg.sample_rate().0,
-            out_cfg.sample_rate().0
-        );
-    }
-
-    // --- Stream de captura (micrófono) → mic_buf (estéreo i16) -------------
-    let in_stream = {
-        let mic_buf = mic_buf.clone();
-        let err_fn = |e| tracing::warn!("error stream entrada: {e}");
-        match in_cfg.sample_format() {
-            cpal::SampleFormat::F32 => in_dev.build_input_stream(
-                &in_cfg.clone().into(),
-                move |data: &[f32], _: &_| {
-                    let mut b = mic_buf.lock().unwrap();
-                    push_input_i16(&mut b, data, in_ch, |s| (s.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    cap(&mut b, SAMPLE_RATE as usize * CHANNELS); // ~1 s máx
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => in_dev.build_input_stream(
-                &in_cfg.clone().into(),
-                move |data: &[i16], _: &_| {
-                    let mut b = mic_buf.lock().unwrap();
-                    push_input_i16(&mut b, data, in_ch, |s| s);
-                    cap(&mut b, SAMPLE_RATE as usize * CHANNELS);
-                },
-                err_fn,
-                None,
-            )?,
-            other => bail!("formato de entrada no soportado: {other:?}"),
-        }
-    };
-
-    // --- Stream de reproducción ← play_buf --------------------------------
-    let out_stream = {
-        let play_buf = play_buf.clone();
-        let deaf = deaf.clone();
-        let err_fn = |e| tracing::warn!("error stream salida: {e}");
-        match out_cfg.sample_format() {
-            cpal::SampleFormat::F32 => out_dev.build_output_stream(
-                &out_cfg.clone().into(),
-                move |data: &mut [f32], _: &_| {
-                    let mut b = play_buf.lock().unwrap();
-                    let silent = deaf.load(Ordering::Relaxed);
-                    fill_output(data, &mut b, out_ch, silent, |s| s as f32 / 32767.0);
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => out_dev.build_output_stream(
-                &out_cfg.clone().into(),
-                move |data: &mut [i16], _: &_| {
-                    let mut b = play_buf.lock().unwrap();
-                    let silent = deaf.load(Ordering::Relaxed);
-                    fill_output(data, &mut b, out_ch, silent, |s| s);
-                },
-                err_fn,
-                None,
-            )?,
-            other => bail!("formato de salida no soportado: {other:?}"),
-        }
-    };
-
-    in_stream.play()?;
-    out_stream.play()?;
-
-    // Cifrador y códecs.
+    // Cifrador y códec.
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip)?;
-    let mut decoders: HashMap<u32, Decoder> = HashMap::new();
+    let mut encoder = Encoder::new(OpusRate::Hz48000, Channels::Stereo, Application::Voip)?;
 
     // Hilo de recepción (RX): UDP → descifrar → Opus → play_buf.
     let rx = {
@@ -715,19 +571,33 @@ fn audio_thread(
         })
     };
 
-    // TX en este hilo: mic_buf → Opus → cifrar → UDP.
+    // TX en este hilo: mic_buf → procesado → Opus → cifrar → UDP.
     let mut seq: u16 = rand::random();
     let mut timestamp: u32 = rand::random();
     let mut nonce_ctr: u32 = 0;
     let mut pcm = vec![0i16; FRAME_LEN];
     let mut opus_out = [0u8; 4000];
-    let mut gate = NoiseGate::new();
+    let mut processor = audio::VoiceProcessor::new();
     // Diagnóstico TX.
     let mut frames_sent: u64 = 0;
     let mut empty_waits: u64 = 0;
     let mut warned_no_mic = false;
 
     while !stop.load(Ordering::Relaxed) {
+        // ¿Cambió el usuario de dispositivo en «Ajustes de voz»? Reabrir streams
+        // sin tirar la llamada. Se liberan primero los actuales (exclusividad).
+        if opts.generation() != device_gen {
+            device_gen = opts.generation();
+            streams = None;
+            match open_call_streams(&mic_buf, &play_buf, &deaf) {
+                Ok(s) => {
+                    streams = Some(s);
+                    tracing::info!("audio: dispositivos cambiados en vivo");
+                }
+                Err(e) => tracing::warn!("audio: no se pudo cambiar de dispositivo: {e}"),
+            }
+        }
+
         // Espera a tener un frame completo de micrófono.
         let ready = {
             let b = mic_buf.lock().unwrap();
@@ -753,13 +623,15 @@ fn audio_thread(
 
         if mute.load(Ordering::Relaxed) {
             // Avanza marcas de tiempo aunque no se transmita.
+            opts.set_mic_level(0);
             seq = seq.wrapping_add(1);
             timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
             continue;
         }
 
-        // Supresor de ruido blanco: atenúa la trama si es ruido de fondo del micro.
-        gate.process(&mut pcm);
+        // Cadena de procesamiento del micro (Ajustes de voz): volumen de
+        // entrada → AGC → anti-eco → puerta de ruido. Toggles en vivo.
+        processor.process(&mut pcm);
 
         let n = encoder.encode(&pcm, &mut opus_out)?;
 
@@ -806,9 +678,7 @@ fn audio_thread(
     }
 
     let _ = rx.join();
-    let _ = &mut decoders; // (los decoders viven en rx_loop)
-    drop(in_stream);
-    drop(out_stream);
+    drop(streams);
     Ok(())
 }
 
@@ -906,7 +776,7 @@ fn rx_loop(
 
         let dec = decoders
             .entry(ssrc)
-            .or_insert_with(|| Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap());
+            .or_insert_with(|| Decoder::new(OpusRate::Hz48000, Channels::Stereo).unwrap());
         match dec.decode(Some(&opus), &mut pcm, false) {
             Ok(samples) => {
                 decoded += 1;
@@ -1032,54 +902,5 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Acota un buffer a `max` elementos descartando los más antiguos.
-fn cap(b: &mut VecDeque<i16>, max: usize) {
-    while b.len() > max {
-        b.pop_front();
-    }
-}
-
-/// Inserta muestras del micrófono normalizadas a estéreo i16.
-fn push_input_i16<T: Copy>(
-    out: &mut VecDeque<i16>,
-    data: &[T],
-    in_ch: usize,
-    conv: impl Fn(T) -> i16,
-) {
-    if in_ch == 0 {
-        return;
-    }
-    for frame in data.chunks(in_ch) {
-        let l = conv(frame[0]);
-        let r = if in_ch >= 2 { conv(frame[1]) } else { l };
-        out.push_back(l);
-        out.push_back(r);
-    }
-}
-
-/// Rellena el buffer de salida desde el de reproducción (estéreo i16 fuente).
-fn fill_output<T: Copy + Default>(
-    data: &mut [T],
-    src: &mut VecDeque<i16>,
-    out_ch: usize,
-    silent: bool,
-    conv: impl Fn(i16) -> T,
-) {
-    if out_ch == 0 {
-        return;
-    }
-    for frame in data.chunks_mut(out_ch) {
-        let (l, r) = if silent {
-            (0i16, 0i16)
-        } else {
-            (src.pop_front().unwrap_or(0), src.pop_front().unwrap_or(0))
-        };
-        for (i, slot) in frame.iter_mut().enumerate() {
-            *slot = match i {
-                0 => conv(l),
-                1 => conv(r),
-                _ => T::default(),
-            };
-        }
-    }
-}
+// (Los helpers de PCM — `cap`, `push_input_i16`, `fill_output` — viven ahora en
+// `audio.rs`, compartidos con la prueba de micrófono de «Ajustes de voz».)

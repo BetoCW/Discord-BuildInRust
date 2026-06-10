@@ -1,6 +1,69 @@
 # Continuar mañana — discord-lite
 
-## ⭐ ÚLTIMA SESIÓN (2026-06-07) — ARREGLADO EL HASHRATCHET DAVE (context de generación)
+## ⭐ ÚLTIMA SESIÓN (2026-06-10) — AJUSTES DE VOZ ESTILO DISCORD (anti-eco + volumen)
+
+Motivo: los amigos oían **eco** y al usuario **muy bajo**. Añadido un panel
+«⚙ Ajustes de voz» (botón en la sección Voz de la barra lateral) que replica el
+panel Voz y vídeo de Discord, y la cadena de procesamiento del micro que arregla
+ambos problemas. Release 2026-06-10 copiado a `dist\`. Compila + 4 tests OK.
+
+### Qué hay nuevo
+- **`src/audio.rs` (nuevo)**: opciones de audio EN VIVO (singleton `options()`
+  con atómicos, leído por trama desde los hilos de audio), enumeración y
+  selección de dispositivos cpal, preferencia de config a **48 kHz** (antes se
+  usaba la default del dispositivo aunque no fuera 48k), helpers PCM compartidos
+  (`push_input_i16`/`fill_output`/`cap`), y la cadena `VoiceProcessor`:
+  1. **Volumen de entrada** (slider 0–200%, como Discord).
+  2. **AGC** (`Agc`): acerca la voz a ~-15 dBFS (gain 0.25–6×, suave; solo se
+     adapta con señal > umbral para no subir el ruido). ⇐ arregla el "se oye bajo".
+  3. **Cancelación de eco** (`EchoDucker`): ducking del micro mientras suena la
+     voz remota (envolvente `out_env` alimentada por `fill_output` de la llamada,
+     NO por la prueba de mic). Aprende el acople altavoz→micro (ratio RMS,
+     persigue el mínimo) para dejar pasar el doble-habla. ⇐ arregla el eco.
+  4. **Puerta de ruido** (movida desde voice.rs): auto (piso aprendido) o
+     **manual** con el slider de sensibilidad en dB.
+  - **Prueba de micrófono** (`start_mic_test`): captura→misma cadena→loopback a
+    la salida elegida + medidor (`mic_level` 0–100, escala dB) para la UI.
+- **`src/ui.rs`**: ventana «Ajustes de voz» estilo Discord (#313338, headers en
+  gris mayúsculas, blurple/verde): dispositivos entrada/salida (Choice,
+  «Predeterminado» = default del sistema), volúmenes 0–200%, «PROBEMOS EL
+  MICRÓFONO» con barra verde en vivo (timeout 60 ms), «SENSIBILIDAD DE ENTRADA»
+  (check auto + slider dB que se desactiva en auto), «PROCESAMIENTO DE VOZ»
+  (3 checks: eco/ruido/AGC). Todo se aplica al instante y persiste en config.
+- **`src/config.rs`**: struct `VoiceSettings` (`cfg.voice`) con serde defaults;
+  se vuelca a `audio::options()` al arrancar (`audio::apply_settings`).
+- **`src/voice.rs`**: usa los dispositivos elegidos; el TX corre la cadena
+  `VoiceProcessor` en vez del gate suelto; **hot-swap de dispositivos en plena
+  llamada** (contador `device_generation`: al cambiar en la UI, el hilo de audio
+  suelta los streams y reabre los nuevos sin cortar la sesión); volumen de
+  salida aplicado en el callback de reproducción (cambio en vivo).
+
+### También en esta sesión (2026-06-10, parte 2)
+- **Icono nuevo**: `icono nuevo.png` (fuente 1024px) → regenerados `icon.ico`
+  (multi-tamaño 16–256, exe/instalador), `icon.png` e `icon_window.png` con
+  Pillow (recorte del margen transparente). El exe release ya lo lleva.
+- **Instalador**: `installer\discord-lite.iss` (Inno Setup 6, instalado vía
+  winget). Compilar: `ISCC.exe installer\discord-lite.iss` → genera
+  `dist\discord-lite-setup-<versión>.exe`. Per-user (sin admin), accesos
+  directos, desinstalador, y al final ofrece abrir
+  `ms-settings:privacy-microphone`: la causa más probable de que al compañero
+  no se le oyera es el permiso de micrófono de Windows para apps de escritorio
+  (la app captura silencio → "TX: el micrófono no produce audio" en el log).
+- Versión subida a **0.2.0** (Cargo.toml + instalador).
+
+### Pendiente de verificar EN VIVO (con los amigos)
+- Que ya **no haya eco** con la cancelación activada (y que el doble-habla no
+  corte demasiado; si corta, bajar el factor 3.0 de `EchoDucker::process` o el
+  duck 0.15).
+- Que con AGC el volumen llegue bien (si satura, bajar TARGET_RMS 5500).
+- El medidor/prueba de mic en la máquina real (latencia del loopback aceptable).
+- NOTA: sigue SIN remuestreo; ahora se fuerza 48 kHz si el dispositivo lo
+  soporta (WASAPI compartido normalmente sí). Si algún dispositivo no lo
+  soporta, se loguea warn y sonará mal (igual que antes).
+
+---
+
+## ÚLTIMA SESIÓN (2026-06-07) — ARREGLADO EL HASHRATCHET DAVE (context de generación)
 
 **Causa raíz del `fallo_dave≈96%` (y de que el amigo nunca confirmara oírnos):** el
 `HashRatchet` de DAVE derivaba la clave con **context vacío**. RFC 9420 §9 y libdave/mlspp
