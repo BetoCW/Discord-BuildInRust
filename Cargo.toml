@@ -1,0 +1,60 @@
+[package]
+name = "discord-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Cliente Discord nativo y ultraligero (uso personal): texto + voz"
+license = "MIT OR Apache-2.0"
+
+# Núcleo de red/estado (Rust puro; TLS vía native-tls = SChannel en Windows,
+# para no requerir Visual Studio Build Tools con el toolchain GNU).
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+# Solo el backend nativo del SO; en Windows usa Credential Manager (sin C/dbus).
+keyring = { version = "3", features = ["windows-native"] }
+directories = "5"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+url = "2"
+
+# GUI nativa ligera (objetivo de RAM). Compila FLTK desde fuente con CMake+g++.
+fltk = "1.4"
+
+# Importación del token desde el Discord oficial local (cuenta propia):
+# descifrado AES-256-GCM de la clave protegida con DPAPI (ver token_import.rs).
+aes-gcm = "0.10"
+base64 = "0.22"
+regex = "1"
+
+# --- Voz (Fase 2): audio + códec Opus + cifrado del paquete de voz ---
+cpal = "0.15"            # captura/reproducción (WASAPI en Windows)
+audiopus = "0.2"         # códec Opus (vendoriza libopus, build con CMake+gcc)
+chacha20poly1305 = "0.10" # cifrado de voz (aead_xchacha20_poly1305_rtpsize)
+byteorder = "1"          # encabezado RTP
+
+# --- DAVE (E2EE de voz): MLS RFC 9420 + cifrado de frames ---
+# (aes-gcm ya está declarado arriba; sirve también para los frames DAVE)
+openmls = "0.6"           # implementación MLS (ciphersuite P256)
+openmls_rust_crypto = "0.3"
+openmls_traits = "0.3"
+openmls_basic_credential = "0.3"  # credencial básica + firma
+hkdf = "0.12"             # ratchet de claves por generación
+hmac = "0.12"             # HKDF-Expand manual (PRK corto, estilo MLS)
+sha2 = "0.10"
+# GCM-128 manual con tag truncado a 64 bits (la crate aes-gcm no permite tag<12B)
+aes = "0.8"
+ghash = "0.5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

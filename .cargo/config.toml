@@ -1,0 +1,9 @@
+# Variables de entorno del proyecto para la compilación.
+#
+# audiopus_sys (Opus) no puede construir libopus desde fuente con el toolchain
+# GNU (necesita autotools/sh/make estilo Unix). En su lugar enlazamos una
+# libopus.a precompilada con mingw (ver thirdparty/opus-lib/ y README).
+[env]
+OPUS_LIB_DIR = "C:/Projectos/Discord/thirdparty/opus-lib"
+OPUS_STATIC = "1"
+OPUS_NO_PKG = "1"

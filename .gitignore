@@ -1,0 +1,16 @@
+# Rust
+/target
+
+# Distribución (artefacto construido + acceso directo)
+/dist
+
+# Secretos y configuración local — NUNCA versionar (RNF-8, R-2)
+*.token
+token.txt
+config.local.*
+/secrets
+.env
+
+# Artefactos del SO
+Thumbs.db
+.DS_Store
