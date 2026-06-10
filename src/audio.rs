@@ -99,14 +99,15 @@ impl AudioOptions {
     pub fn out_env(&self) -> f32 {
         f32::from_bits(self.out_env.load(Ordering::Relaxed))
     }
-    /// Actualiza la envolvente de reproducción: sube rápido y baja despacio,
-    /// para que el anti-eco cubra también las colas de las frases.
+    /// Actualiza la envolvente (suavizada) de lo que se reproduce. Se suaviza en
+    /// AMBOS sentidos para que el anti-eco vea un nivel estable y no module el
+    /// micro trama a trama (esa modulación es lo que «robotiza» la voz).
     pub fn update_out_env(&self, rms: f32) {
         let prev = self.out_env();
         let env = if rms > prev {
-            prev * 0.3 + rms * 0.7
+            prev * 0.7 + rms * 0.3
         } else {
-            prev * 0.9 + rms * 0.1
+            prev * 0.95 + rms * 0.05
         };
         self.out_env.store(env.to_bits(), Ordering::Relaxed);
     }
@@ -256,11 +257,14 @@ impl Agc {
     }
 
     pub fn process(&mut self, pcm: &mut [i16]) {
-        const TARGET_RMS: f32 = 5500.0; // ~ -15.5 dBFS
+        const TARGET_RMS: f32 = 4500.0; // ~ -17 dBFS
         let r = rms(pcm);
-        if r > 600.0 {
-            let desired = (TARGET_RMS / r).clamp(0.25, 6.0);
-            self.gain += (desired - self.gain) * 0.06;
+        // Adaptación LENTA (2 %/trama ≈ 1 s de constante de tiempo) y solo con
+        // voz clara: si la ganancia cambia rápido entre tramas, modula la voz y
+        // suena robótica. Tope 4× para no amplificar hasta saturar/clipping.
+        if r > 700.0 {
+            let desired = (TARGET_RMS / r).clamp(0.3, 4.0);
+            self.gain += (desired - self.gain) * 0.02;
         }
         if (self.gain - 1.0).abs() > 0.01 {
             apply_gain(pcm, self.gain);
@@ -269,9 +273,14 @@ impl Agc {
 }
 
 /// Cancelación de eco por atenuación (ducking): mientras suena la voz de otros
-/// por los altavoces, atenúa fuertemente el micrófono salvo que el usuario esté
-/// hablando claramente por encima del eco esperado. Aprende el acople acústico
-/// altavoz→micro (ratio RMS) para distinguir eco de voz propia (doble-habla).
+/// por los altavoces, atenúa el micrófono salvo que el usuario esté hablando por
+/// encima del eco esperado. Aprende el acople acústico altavoz→micro (ratio RMS)
+/// para no atenuar durante el doble-habla.
+///
+/// CLAVE para no «robotizar»: el factor de atenuación se mueve MUY despacio entre
+/// tramas (constantes de tiempo de ~100–300 ms) y la atenuación mínima es modesta
+/// (-9 dB). Una atenuación fuerte que conmuta trama a trama modula la amplitud de
+/// la voz y produce el efecto robótico/entrecortado; aquí se evita a propósito.
 pub struct EchoDucker {
     coupling: f32, // eco_en_micro ≈ coupling · rms_reproducido (aprendido)
     duck: f32,     // atenuación actual aplicada (suavizada)
@@ -282,19 +291,23 @@ impl EchoDucker {
         Self { coupling: 0.5, duck: 1.0 }
     }
 
-    pub fn process(&mut self, pcm: &mut [i16], mic_rms: f32, out_rms: f32) {
-        let far_active = out_rms > 300.0;
+    /// `far_rms` debe ser la envolvente YA suavizada de la reproducción
+    /// (`options().out_env()`), no el RMS instantáneo.
+    pub fn process(&mut self, pcm: &mut [i16], mic_rms: f32, far_rms: f32) {
+        let far_active = far_rms > 250.0;
         if far_active {
-            let ratio = (mic_rms / out_rms.max(1.0)).min(4.0);
-            // Persigue el mínimo: baja rápido (frames donde solo hay eco) y sube
-            // muy lento (para no aprender la voz del usuario como "eco").
-            let a = if ratio < self.coupling { 0.2 } else { 0.005 };
+            let ratio = (mic_rms / far_rms.max(1.0)).min(4.0);
+            // Aprende el acople despacio (persigue el mínimo para quedarse con el
+            // eco, no con la voz del usuario superpuesta).
+            let a = if ratio < self.coupling { 0.05 } else { 0.003 };
             self.coupling += (ratio - self.coupling) * a;
         }
-        let expected_echo = self.coupling * out_rms;
-        let speaking = mic_rms > (expected_echo * 3.0).max(900.0);
-        let target = if far_active && !speaking { 0.15 } else { 1.0 };
-        let coeff = if target < self.duck { 0.5 } else { 0.15 };
+        let expected_echo = self.coupling * far_rms;
+        let speaking = mic_rms > (expected_echo * 2.0).max(800.0);
+        // Atenuación máxima moderada (0.4 ≈ -8 dB) y SIEMPRE suavizada despacio,
+        // para reducir el eco sin recortar la voz a trozos.
+        let target = if far_active && !speaking { 0.4 } else { 1.0 };
+        let coeff = if target < self.duck { 0.08 } else { 0.04 };
         self.duck += (target - self.duck) * coeff;
         if self.duck < 0.999 {
             apply_gain(pcm, self.duck);
@@ -384,34 +397,44 @@ pub fn find_output_device() -> Result<cpal::Device> {
         .ok_or_else(|| anyhow!("sin altavoz por defecto"))
 }
 
-/// Elige una config del dispositivo a 48 kHz si la soporta (evita el audio a
-/// velocidad/tono incorrecto: no hay remuestreo); si no, la predeterminada.
+/// Config del dispositivo a usar. Prioriza la **config predeterminada** del
+/// dispositivo (la del modo compartido de WASAPI), que es la ruta probada que
+/// funciona: forzar un formato distinto del de la mezcla compartida puede dar
+/// audio entrecortado/robótico. Solo si el predeterminado NO es 48 kHz se busca
+/// un rango que sí lo soporte con el MISMO nº de canales (para evitar el audio a
+/// tono incorrecto cuando no hay remuestreo).
 fn config_48k(dev: &cpal::Device, input: bool) -> Result<cpal::SupportedStreamConfig> {
-    let pick = |ranges: Vec<cpal::SupportedStreamConfigRange>| {
+    let default = if input {
+        dev.default_input_config()?
+    } else {
+        dev.default_output_config()?
+    };
+    if default.sample_rate().0 == SAMPLE_RATE {
+        return Ok(default); // ruta conocida-buena: no tocar el formato compartido
+    }
+    let want_ch = default.channels();
+    let pick = |ranges: Vec<cpal::SupportedStreamConfigRange>, ch_exact: bool| {
         ranges.into_iter().find(|r| {
             r.min_sample_rate().0 <= SAMPLE_RATE
                 && r.max_sample_rate().0 >= SAMPLE_RATE
+                && (!ch_exact || r.channels() == want_ch)
                 && matches!(
                     r.sample_format(),
                     cpal::SampleFormat::F32 | cpal::SampleFormat::I16
                 )
         })
     };
-    if input {
-        if let Ok(ranges) = dev.supported_input_configs() {
-            if let Some(r) = pick(ranges.collect()) {
-                return Ok(r.with_sample_rate(cpal::SampleRate(SAMPLE_RATE)));
-            }
-        }
-        Ok(dev.default_input_config()?)
+    let ranges: Vec<_> = if input {
+        dev.supported_input_configs().map(|i| i.collect()).unwrap_or_default()
     } else {
-        if let Ok(ranges) = dev.supported_output_configs() {
-            if let Some(r) = pick(ranges.collect()) {
-                return Ok(r.with_sample_rate(cpal::SampleRate(SAMPLE_RATE)));
-            }
-        }
-        Ok(dev.default_output_config()?)
+        dev.supported_output_configs().map(|i| i.collect()).unwrap_or_default()
+    };
+    // Primero un rango de 48 kHz con el mismo nº de canales que el predeterminado;
+    // si no, cualquiera a 48 kHz; si tampoco, el predeterminado (con aviso).
+    if let Some(r) = pick(ranges.clone(), true).or_else(|| pick(ranges, false)) {
+        return Ok(r.with_sample_rate(cpal::SampleRate(SAMPLE_RATE)));
     }
+    Ok(default)
 }
 
 /// Abre el stream de captura del micrófono elegido → `buf` (estéreo i16 48 kHz).

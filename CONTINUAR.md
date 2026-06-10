@@ -1,6 +1,43 @@
 # Continuar mañana — discord-lite
 
-## ⭐ ÚLTIMA SESIÓN (2026-06-10) — AJUSTES DE VOZ ESTILO DISCORD (anti-eco + volumen)
+## ⭐ ÚLTIMA SESIÓN (2026-06-10, parte 3) — ARREGLO: la voz salía ROBOTIZADA (v0.2.1)
+
+Tras v0.2.0 la voz salía **robótica/entrecortada** y «saturaba» el canal (los
+demás también se oían mal). **Causa raíz:** el procesado nuevo aplicaba al micro
+una **ganancia que cambiaba trama a trama** (cada 20 ms):
+- `EchoDucker` bajaba el micro a **0.15** y volvía a 1.0 con constantes muy
+  rápidas (ataque 0.5/trama) según fluctuaba la voz remota → **modulación de
+  amplitud** = efecto robótico. Iba en la ruta TX, así que los demás me oían así.
+- `Agc` ajustaba la ganancia rápido (0.06/trama) con el RMS ruidoso por trama →
+  más modulación.
+- Ambos venían **activados por defecto** en v0.2.0 (la versión que SÍ funcionaba
+  no tenía nada de esto), de ahí la regresión.
+- Verificado que NO hay flood de paquetes: sigue 1 `sock.send` por trama, paced
+  por el micro (50/s). La «saturación» era el artefacto de audio, no la red.
+
+**Fix (v0.2.1):**
+- `EchoDucker`: atenuación mínima moderada **0.4 (-8 dB)** y suavizado lento en
+  ambos sentidos (coeff 0.04–0.08, ~100–300 ms); lee la envolvente **ya
+  suavizada** `out_env` (no el RMS instantáneo). No recorta la voz a trozos.
+- `Agc`: adaptación lenta **0.02/trama** (~1 s), tope **4×**, target -17 dBFS.
+- `update_out_env`: suavizado en ambos sentidos (antes subía rápido 0.7).
+- **Defaults seguros**: `echo_suppression=false` y `auto_gain=false` (la llamada
+  sale igual que la versión buena: solo la puerta de ruido, que sí funcionaba).
+  Son **opt-in** desde «⚙ Ajustes de voz». `noise_suppression=true` se mantiene.
+- `config_48k`: ahora **prioriza la config predeterminada** del dispositivo (modo
+  compartido WASAPI = ruta probada); solo busca otro rango de 48 kHz si el
+  predeterminado no es 48 kHz, y con el mismo nº de canales. Evita forzar un
+  formato que WASAPI compartido no honra (otra posible fuente de glitches).
+- Versión **0.2.1** (Cargo.toml + instalador). Release publicado con installer+exe.
+
+**Pendiente de probar EN VIVO:** confirmar que ya NO robotiza con defaults; si el
+amigo tiene eco y NO usa auriculares, activar «Cancelación de eco» y comprobar que
+ahora atenúa suave sin robotizar (si aún recorta, subir el floor 0.4 o bajar los
+coeff del ducker).
+
+---
+
+## ÚLTIMA SESIÓN (2026-06-10) — AJUSTES DE VOZ ESTILO DISCORD (anti-eco + volumen)
 
 Motivo: los amigos oían **eco** y al usuario **muy bajo**. Añadido un panel
 «⚙ Ajustes de voz» (botón en la sección Voz de la barra lateral) que replica el

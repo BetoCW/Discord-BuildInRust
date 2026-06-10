@@ -33,13 +33,16 @@ pub struct VoiceSettings {
     #[serde(default = "default_volume")]
     pub output_volume: u32,
     /// Cancelación de eco (atenúa el micro mientras suena la voz de otros).
-    #[serde(default = "default_true")]
+    /// Por defecto DESACTIVADA: solo hace falta sin auriculares, y al introducir
+    /// atenuación dependiente de la señal puede degradar la voz; es opt-in.
+    #[serde(default = "default_false")]
     pub echo_suppression: bool,
-    /// Supresión de ruido (puerta de ruido).
+    /// Supresión de ruido (puerta de ruido). Es la cadena que ya funcionaba.
     #[serde(default = "default_true")]
     pub noise_suppression: bool,
     /// Control automático de ganancia (sube los micros que se oyen bajos).
-    #[serde(default = "default_true")]
+    /// Opt-in: cambia el volumen de forma dinámica y conviene probarlo antes.
+    #[serde(default = "default_false")]
     pub auto_gain: bool,
     /// Sensibilidad de entrada automática.
     #[serde(default = "default_true")]
@@ -56,9 +59,9 @@ impl Default for VoiceSettings {
             output_device: None,
             input_volume: default_volume(),
             output_volume: default_volume(),
-            echo_suppression: true,
+            echo_suppression: false,
             noise_suppression: true,
-            auto_gain: true,
+            auto_gain: false,
             auto_sensitivity: true,
             sensitivity_db: default_sensitivity(),
         }
@@ -95,6 +98,10 @@ fn default_volume() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_sensitivity() -> i32 {
