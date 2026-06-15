@@ -176,6 +176,19 @@ async fn session(
         rx_e2ee: Arc::new(Mutex::new(HashMap::new())),
         e2ee_active: Arc::new(AtomicBool::new(false)),
     };
+    // Mata los hilos de audio cuando la sesión termina POR CUALQUIER VÍA (también
+    // por error, p. ej. close 4006 "session no longer valid"). Sin esto, al caer
+    // la sesión los hilos TX/RX seguían vivos capturando el micro y enviando UDP
+    // indefinidamente; si el usuario se reconectaba, había DOBLE captura del
+    // micrófono → audio duplicado para los demás (eco). El guard se dispara en su
+    // Drop al salir de `session`, antes de que `shared` se libere.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _stop_guard = StopOnDrop(shared.stop.clone());
     let mut audio_started = false;
 
     loop {
@@ -558,6 +571,22 @@ fn audio_thread(
     // Cifrador y códec.
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let mut encoder = Encoder::new(OpusRate::Hz48000, Channels::Stereo, Application::Voip)?;
+    // Resiliencia ante pérdida de paquetes (lo que hace robusto a Discord):
+    // - FEC in-band: cada paquete lleva una copia de baja tasa del frame ANTERIOR,
+    //   para reconstruirlo si se pierde (el RX lo aprovecha con decode(fec=true)).
+    // - packet_loss_perc: avisa al codec del % de pérdida esperado para que ajuste
+    //   cuánta redundancia FEC incluye.
+    // - bitrate fijo ~64 kbps: el de voz típico de Discord; estable y suficiente.
+    // Si el backend no soporta alguna opción, se ignora con un warn (no es fatal).
+    if let Err(e) = encoder.set_inband_fec(true) {
+        tracing::warn!("Opus: no se pudo activar FEC in-band: {e}");
+    }
+    if let Err(e) = encoder.set_packet_loss_perc(10) {
+        tracing::warn!("Opus: no se pudo fijar packet_loss_perc: {e}");
+    }
+    if let Err(e) = encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(64_000)) {
+        tracing::warn!("Opus: no se pudo fijar bitrate: {e}");
+    }
 
     // Hilo de recepción (RX): UDP → descifrar → Opus → play_buf.
     let rx = {
@@ -682,6 +711,136 @@ fn audio_thread(
     Ok(())
 }
 
+/// Distancia con signo entre dos números de secuencia RTP de 16 bits. Maneja el
+/// wrap-around: `seq_diff(a, b) > 0` ⇒ `a` es posterior a `b` (en ventanas <32768).
+fn seq_diff(a: u16, b: u16) -> i16 {
+    a.wrapping_sub(b) as i16
+}
+
+/// Buffer de jitter por emisor (SSRC). UDP entrega los paquetes desordenados y
+/// con jitter; sin reordenar, el audio se entrecorta. Este buffer:
+/// - **Reordena** los paquetes Opus por número de secuencia RTP.
+/// - Mantiene un **cojín** de `DEPTH` frames (~60 ms) para que los paquetes
+///   reordenados/tardíos lleguen antes de darlos por perdidos.
+/// - Rellena los huecos de paquetes perdidos con **FEC** de Opus (si el paquete
+///   siguiente llegó, lleva embebida una copia de baja tasa del perdido) o, si no,
+///   con **PLC** (Opus inventa un frame de relleno plausible).
+///
+/// `play_buf` (callback de cpal) sigue siendo el reloj de reproducción y suaviza
+/// extra; aquí SOLO reordenamos + concealing. No toca la capa DAVE/E2EE.
+struct JitterBuffer {
+    decoder: Decoder,
+    /// seq → contenido. `Some(opus)` = audio por decodificar; `None` = marcador de
+    /// **silencio** (comfort-noise del emisor): ese seq existe pero no es audio, así
+    /// que solo avanza el cursor (NO se conceala con PLC ni se emite nada).
+    pending: HashMap<u16, Option<Vec<u8>>>,
+    next: Option<u16>, // próximo seq a emitir (None = aún cebando)
+    pcm: Vec<i16>,     // scratch de un frame decodificado
+}
+
+impl JitterBuffer {
+    /// Frames de cojín que se retienen antes de emitir/concealar (~60 ms a 50/s).
+    /// Absorbe el reordenamiento típico de UDP sin añadir latencia perceptible.
+    const DEPTH: usize = 3;
+    /// Si el hueco hasta el paquete más antiguo supera esto, resincroniza en vez
+    /// de concealar cientos de frames (evita ráfagas de relleno tras un corte).
+    const MAX: usize = 24;
+
+    fn new() -> Self {
+        Self {
+            decoder: Decoder::new(OpusRate::Hz48000, Channels::Stereo).unwrap(),
+            pending: HashMap::new(),
+            next: None,
+            pcm: vec![0i16; FRAME_LEN],
+        }
+    }
+
+    /// Inserta un paquete de audio Opus (con el `seq` de su header RTP).
+    fn push(&mut self, seq: u16, opus: Vec<u8>, out: &mut Vec<i16>) -> (usize, usize) {
+        self.insert(seq, Some(opus), out)
+    }
+
+    /// Marca un `seq` como **silencio** (frame de comfort-noise del emisor, sin audio
+    /// real). Mantiene la continuidad de la secuencia para que el siguiente audio NO
+    /// se vea como un hueco perdido y se rellene con PLC fabricado. Clave con varios
+    /// emisores: durante los silencios de cada uno llegan estos marcadores.
+    fn note_silence(&mut self, seq: u16, out: &mut Vec<i16>) -> (usize, usize) {
+        self.insert(seq, None, out)
+    }
+
+    /// Inserta `slot` (Some=audio, None=silencio) en `seq` y emite en orden lo que
+    /// se pueda, rellenando con PLC/FEC solo los huecos REALMENTE perdidos. Devuelve
+    /// `(frames_emitidos, frames_concealados)`.
+    fn insert(&mut self, seq: u16, slot: Option<Vec<u8>>, out: &mut Vec<i16>) -> (usize, usize) {
+        // Más viejo que el cursor: llegó demasiado tarde, ya pasó su turno.
+        if let Some(next) = self.next {
+            if seq_diff(seq, next) < 0 {
+                return (0, 0);
+            }
+        }
+        self.pending.insert(seq, slot);
+        // Cebado: arranca al superar el cojín, empezando por el seq más antiguo.
+        if self.next.is_none() {
+            if self.pending.len() <= Self::DEPTH {
+                return (0, 0);
+            }
+            self.next = Some(self.oldest_seq());
+        }
+
+        let (mut frames, mut concealed) = (0, 0);
+        // Mantén siempre DEPTH frames de cojín; emite el resto en orden.
+        while self.pending.len() > Self::DEPTH {
+            let next = self.next.unwrap();
+            if let Some(slot) = self.pending.remove(&next) {
+                match slot {
+                    // Audio: decodifícalo.
+                    Some(op) => {
+                        if let Ok(s) = self.decoder.decode(Some(&op[..]), &mut self.pcm, false) {
+                            out.extend_from_slice(&self.pcm[..s * CHANNELS]);
+                            frames += 1;
+                        }
+                    }
+                    // Silencio conocido: solo avanza (sin emitir ni concealar).
+                    None => {}
+                }
+                self.next = Some(next.wrapping_add(1));
+            } else {
+                // Hueco real (perdido). Si el salto hasta el siguiente paquete es
+                // enorme, resincroniza (no concealar el corte entero).
+                let oldest = self.oldest_seq();
+                if seq_diff(oldest, next) > Self::MAX as i16 {
+                    self.next = Some(oldest);
+                    continue;
+                }
+                // FEC desde el paquete siguiente si llegó (y es audio); si no, PLC.
+                let n1 = next.wrapping_add(1);
+                let ok = match self.pending.get(&n1) {
+                    Some(Some(op1)) => {
+                        self.decoder.decode(Some(&op1[..]), &mut self.pcm, true).is_ok()
+                    }
+                    _ => self.decoder.decode(None::<&[u8]>, &mut self.pcm, false).is_ok(),
+                };
+                if ok {
+                    out.extend_from_slice(&self.pcm[..FRAME_SAMPLES * CHANNELS]);
+                    frames += 1;
+                    concealed += 1;
+                }
+                self.next = Some(n1);
+            }
+        }
+        (frames, concealed)
+    }
+
+    /// El seq más antiguo del buffer según aritmética con wrap (buffer no vacío).
+    fn oldest_seq(&self) -> u16 {
+        self.pending
+            .keys()
+            .copied()
+            .reduce(|a, b| if seq_diff(b, a) < 0 { b } else { a })
+            .unwrap()
+    }
+}
+
 /// Bucle de recepción de audio.
 fn rx_loop(
     sock: UdpSocket,
@@ -693,17 +852,18 @@ fn rx_loop(
     play_buf: Arc<Mutex<VecDeque<i16>>>,
 ) {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-    let mut decoders: HashMap<u32, Decoder> = HashMap::new();
+    // Un jitter buffer por emisor: reordena por seq RTP y rellena huecos (PLC/FEC).
+    let mut jitters: HashMap<u32, JitterBuffer> = HashMap::new();
     let mut buf = [0u8; 4096];
-    let mut pcm = vec![0i16; FRAME_LEN];
     // Contadores RX. `relleno` = frames de silencio/marcadores del emisor (sin
     // magic DAVE), que NO son audio y no deben contarse como fallo real.
-    let (mut recv, mut transport_fail, mut dave_fail, mut relleno, mut no_key, mut decoded) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-    let report = |recv, transport_fail, dave_fail, relleno, no_key, decoded| {
+    // `concealados` = frames perdidos reconstruidos por PLC/FEC del jitter buffer.
+    let (mut recv, mut transport_fail, mut dave_fail, mut relleno, mut no_key, mut decoded, mut concealed) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let report = |recv, transport_fail, dave_fail, relleno, no_key, decoded, concealed| {
         tracing::info!(
             "RX: recibidos={recv}, fallo_transporte={transport_fail}, fallo_dave={dave_fail}, \
-             relleno={relleno}, sin_clave={no_key}, decodificados={decoded}"
+             relleno={relleno}, sin_clave={no_key}, decodificados={decoded}, concealados={concealed}"
         );
     };
 
@@ -722,7 +882,7 @@ fn rx_loop(
         // Reporte periódico ANTES de cualquier `continue`: así vemos paquetes que
         // llegan pero fallan en transporte/DAVE/sin_clave (antes quedaban mudos).
         if recv % 250 == 0 {
-            report(recv, transport_fail, dave_fail, relleno, no_key, decoded);
+            report(recv, transport_fail, dave_fail, relleno, no_key, decoded, concealed);
         }
         let packet = &buf[..n];
         let hlen = match unencrypted_prefix_len(packet, n) {
@@ -730,6 +890,8 @@ fn rx_loop(
             None => continue,
         };
         let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        // Número de secuencia RTP (header BE): clave para reordenar en el jitter buffer.
+        let seq = u16::from_be_bytes([packet[2], packet[3]]);
         let aad = &packet[..hlen];
         let ct = &packet[hlen..n - 4];
         let mut nonce = [0u8; 24];
@@ -747,12 +909,13 @@ fn rx_loop(
         }
 
         // Capa DAVE (E2EE): si tenemos la clave de este emisor, desenvuelve el
-        // frame para obtener el Opus. Con E2EE activo pero sin clave todavía
-        // (op5 SPEAKING aún no llegó o Welcome no procesado), descarta el frame:
-        // su contenido es ciphertext DAVE, no Opus en claro.
-        let opus: Vec<u8> = if let Some(cryptor) = rx_e2ee.lock().unwrap().get(&ssrc) {
+        // frame. Resultado: `Some(Some(opus))` = audio; `Some(None)` = silencio
+        // (comfort-noise, marca el seq sin emitir audio); `None` = descartar.
+        let slot: Option<Option<Vec<u8>>> = if let Some(cryptor) =
+            rx_e2ee.lock().unwrap().get(&ssrc)
+        {
             match cryptor.decrypt(&plain) {
-                Ok(o) => o,
+                Ok(o) => Some(Some(o)),
                 Err(_) => {
                     // Sin magic DAVE = frame de relleno/silencio del emisor (no
                     // audio); no es un fallo real. Solo avisamos de fallos de tag.
@@ -761,38 +924,48 @@ fn rx_loop(
                         if dave_fail == 1 || dave_fail % 250 == 0 {
                             tracing::warn!("RX: fallo descifrado DAVE (ssrc={ssrc}, n={dave_fail})");
                         }
+                        None
                     } else {
                         relleno += 1;
+                        Some(None) // marcador de silencio para el jitter buffer
                     }
-                    continue;
                 }
             }
         } else if e2ee_active.load(Ordering::Relaxed) {
             no_key += 1;
-            continue;
+            None
         } else {
-            plain
+            Some(Some(plain))
+        };
+        let slot = match slot {
+            Some(s) => s,
+            None => continue,
         };
 
-        let dec = decoders
-            .entry(ssrc)
-            .or_insert_with(|| Decoder::new(OpusRate::Hz48000, Channels::Stereo).unwrap());
-        match dec.decode(Some(&opus), &mut pcm, false) {
-            Ok(samples) => {
-                decoded += 1;
-                if decoded == 1 || decoded % 250 == 0 {
-                    report(recv, transport_fail, dave_fail, relleno, no_key, decoded);
-                }
-                let mut b = play_buf.lock().unwrap();
-                for &s in &pcm[..samples * CHANNELS] {
-                    b.push_back(s);
-                }
-                cap(&mut b, SAMPLE_RATE as usize * CHANNELS);
+        // Jitter buffer del emisor: reordena por seq, rellena huecos REALES y emite
+        // los frames PCM en orden. Los marcadores de silencio (comfort-noise) solo
+        // mantienen la continuidad de seq → no se rellenan con PLC fabricado.
+        let jb = jitters.entry(ssrc).or_insert_with(JitterBuffer::new);
+        let mut frames_pcm: Vec<i16> = Vec::new();
+        let (emitted, concealed_now) = match slot {
+            Some(opus) => jb.push(seq, opus, &mut frames_pcm),
+            None => jb.note_silence(seq, &mut frames_pcm),
+        };
+        concealed += concealed_now as u64;
+        if emitted > 0 {
+            let was_zero = decoded == 0;
+            decoded += emitted as u64;
+            if was_zero {
+                report(recv, transport_fail, dave_fail, relleno, no_key, decoded, concealed);
             }
-            Err(_) => continue,
+            let mut b = play_buf.lock().unwrap();
+            for &s in &frames_pcm {
+                b.push_back(s);
+            }
+            cap(&mut b, SAMPLE_RATE as usize * CHANNELS);
         }
     }
-    report(recv, transport_fail, dave_fail, relleno, no_key, decoded);
+    report(recv, transport_fail, dave_fail, relleno, no_key, decoded, concealed);
 }
 
 // --- Helpers ---------------------------------------------------------------

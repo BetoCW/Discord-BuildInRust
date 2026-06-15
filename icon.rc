@@ -1,1 +1,36 @@
+// Recursos incrustados en el .exe (procesados por windres en build.rs):
+//  - El icono de la aplicación.
+//  - VERSIONINFO: metadatos del binario (editor, descripción, versión). Un .exe
+//    SIN estos campos parece sospechoso a los antivirus heurísticos; rellenarlos
+//    da legitimidad y reduce (no elimina) los falsos positivos. El arreglo de
+//    fondo de los avisos de "virus" es FIRMAR el binario (Authenticode); ver
+//    README → "Falsos positivos de antivirus".
+//  Mantener la versión sincronizada con Cargo.toml / el instalador.
+
 1 ICON "icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,3,0,0
+PRODUCTVERSION 0,3,0,0
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "BetoCW"
+            VALUE "FileDescription", "discord-lite \342\200\224 cliente Discord ligero (uso personal)"
+            VALUE "FileVersion", "0.3.0.0"
+            VALUE "InternalName", "discord-lite"
+            VALUE "LegalCopyright", "\302\251 2026 BetoCW. Licencia MIT/Apache-2.0."
+            VALUE "OriginalFilename", "discord-lite.exe"
+            VALUE "ProductName", "discord-lite"
+            VALUE "ProductVersion", "0.3.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

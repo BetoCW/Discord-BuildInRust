@@ -1139,10 +1139,34 @@ fn open_voice_settings(ui: &Rc<RefCell<UiState>>, open_flag: Rc<Cell<bool>>) {
     echo_chk.set_tooltip("Atenúa tu micrófono mientras suena la voz de otros (evita que les vuelva su propia voz)");
     echo_chk.set_value(v.echo_suppression);
     col.fixed(&echo_chk, 22);
-    let mut noise_chk = button::CheckButton::default().with_label("Supresión de ruido");
-    noise_chk.set_tooltip("Silencia el ruido de fondo del micrófono cuando no hablas");
-    noise_chk.set_value(v.noise_suppression);
-    col.fixed(&noise_chk, 22);
+    let mut aec_chk =
+        button::CheckButton::default().with_label("Cancelación de eco avanzada (experimental)");
+    aec_chk.set_tooltip(
+        "AEC adaptativo: RESTA el eco en vez de atenuar, así puedes hablar a la vez \
+         que el otro (doble-habla). Experimental: si oyes artefactos o se cancela tu \
+         voz, desactívalo. Cuando está activo sustituye a la cancelación de eco básica.",
+    );
+    aec_chk.set_value(v.aec);
+    col.fixed(&aec_chk, 22);
+    let mut noise_row = group::Flex::default().row();
+    noise_row.set_pad(12);
+    let mut noise_lbl = frame::Frame::default().with_label("Supresión de ruido");
+    noise_lbl.set_label_color(Color::from_rgb(219, 222, 225));
+    noise_lbl.set_align(Align::Left | Align::Inside);
+    noise_row.fixed(&noise_lbl, 150);
+    let mut noise_choice = menu::Choice::default();
+    noise_choice.set_color(Color::from_rgb(30, 31, 34));
+    noise_choice.add_choice("Desactivada");
+    noise_choice.add_choice("Ligera (puerta de ruido)");
+    noise_choice.add_choice("Aislamiento de voz (IA)");
+    noise_choice.set_value(v.noise_mode.as_u8() as i32);
+    noise_choice.set_tooltip(
+        "Desactivada: sin procesar. Ligera: silencia el fondo cuando no hablas \
+         (poca CPU). Aislamiento de voz: red neuronal que separa tu voz del ruido \
+         continuo (teclado, ventilador); más CPU, mejor resultado.",
+    );
+    noise_row.end();
+    col.fixed(&noise_row, 24);
     let mut agc_chk =
         button::CheckButton::default().with_label("Control de ganancia automático");
     agc_chk.set_tooltip("Sube automáticamente el volumen si tu voz se oye baja");
@@ -1286,11 +1310,21 @@ fn open_voice_settings(ui: &Rc<RefCell<UiState>>, open_flag: Rc<Cell<bool>>) {
     }
     {
         let ui = ui.clone();
-        noise_chk.set_callback(move |c| {
+        aec_chk.set_callback(move |c| {
             let on = c.value();
-            audio::options().noise_suppress.store(on, Ordering::Relaxed);
+            audio::options().set_aec(on);
             let mut s = ui.borrow_mut();
-            s.cfg.voice.noise_suppression = on;
+            s.cfg.voice.aec = on;
+            let _ = s.cfg.save();
+        });
+    }
+    {
+        let ui = ui.clone();
+        noise_choice.set_callback(move |c| {
+            let mode = crate::config::NoiseMode::from_u8(c.value().max(0) as u8);
+            audio::options().set_noise_mode(mode);
+            let mut s = ui.borrow_mut();
+            s.cfg.voice.noise_mode = mode;
             let _ = s.cfg.save();
         });
     }

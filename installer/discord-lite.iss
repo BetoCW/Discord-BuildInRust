@@ -9,7 +9,7 @@
 ; captura silencio y "no te oyen" aunque todo lo demás funcione.
 
 #define MyAppName "discord-lite"
-#define MyAppVersion "0.2.1"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "BetoCW"
 #define MyAppURL "https://github.com/BetoCW/Discord-BuildInRust"
 #define MyAppExeName "discord-lite.exe"

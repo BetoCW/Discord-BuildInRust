@@ -47,6 +47,8 @@ humano**. El token da acceso total a la cuenta: trátalo como secreto crítico.
 
 1. Descarga el **instalador** desde [Releases](https://github.com/BetoCW/Discord-BuildInRust/releases/latest)
    y síguelo (no pide administrador). O usa el `.exe` portable si lo prefieres.
+   - ⚠️ Si tu antivirus o SmartScreen lo marca, es un **falso positivo** — ver
+     [Falsos positivos de antivirus](#-falsos-positivos-de-antivirus).
 2. En la pantalla de login tienes dos opciones:
    - **Pega tu token de usuario** y pulsa *Entrar*. Se valida contra la API y se
      guarda de forma segura; no tendrás que volver a introducirlo.
@@ -84,6 +86,33 @@ humano**. El token da acceso total a la cuenta: trátalo como secreto crítico.
   canal, ajustes de voz).
 
 Para cerrar sesión usa el botón **"Cerrar sesión"** (borra el token guardado).
+
+## 🛡️ Falsos positivos de antivirus
+
+Algunos antivirus (o SmartScreen de Windows) marcan el `.exe`/instalador como
+sospechoso. **Es un falso positivo.** Pasa por dos motivos legítimos:
+
+1. **El binario no está firmado** (no tengo un certificado Authenticode, que es de
+   pago). Windows desconfía por defecto de los ejecutables de "editor desconocido".
+2. **El importador de token** lee el almacenamiento local de Discord y lo descifra
+   con DPAPI para sacar *tu propio* token. Ese comportamiento se parece al de un
+   *info-stealer*, así que la heurística de los antivirus lo marca — aunque aquí el
+   token **nunca sale de tu PC** (solo se usa para conectarte y se guarda cifrado).
+
+El código es abierto: puedes revisarlo o **compilarlo tú mismo** (ver
+[Compilar desde el código fuente](#️-compilar-desde-el-código-fuente)), y así el
+binario es de tu máquina y no lo marca nada (por eso en la del autor no salta).
+
+**Qué puedes hacer:**
+- **Compílalo tú mismo** (la opción más limpia y verificable).
+- **Añade una exclusión** en tu antivirus para la carpeta de instalación
+  (`%LOCALAPPDATA%\Programs\discord-lite`).
+- En SmartScreen: *Más información → Ejecutar de todas formas*.
+- **Reporta el falso positivo** a tu antivirus (Microsoft Defender:
+  *Seguridad de Windows → Protección antivirus → enviar muestra*); ayuda a que dejen
+  de marcarlo.
+- El arreglo de fondo sería **firmar** el binario con un certificado de código; está
+  fuera de alcance para un proyecto personal sin coste.
 
 ## 📊 Estado del proyecto
 

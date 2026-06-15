@@ -1,6 +1,173 @@
 # Continuar mañana — discord-lite
 
-## ⭐ ÚLTIMA SESIÓN (2026-06-10, parte 3) — ARREGLO: la voz salía ROBOTIZADA (v0.2.1)
+## 🔬 PRIMERA PRUEBA EN VIVO (2026-06-15) — Metas 1–5 contra la sala real
+
+Log con 6 personas en el canal del amigo (uid 678086459789541386). Resultados:
+- ✅ **RX FUNCIONA EN VIVO**: `decodificados` sube sin parar (→1332 en ~20s),
+  `fallo_transporte`~2.5% (RTCP benigno), `fallo_dave=59` **se estanca** (fallos
+  puntuales del arranque antes de sincronizar claves/epoch 28; NO crece). DAVE/E2EE
+  perfecto (Welcome, 6 claves RX, TX E2EE listo). **Las Metas 1–2 quedan validadas
+  en vivo.**
+- 🐛 **BUG ENCONTRADO Y ARREGLADO — concealment inflado (~18%)**: `relleno=275` ≈
+  `concealados=235` (correlación delatora). Causa: los frames de comfort-noise (sin
+  magic DAVE) se descartaban con `continue` ANTES del jitter buffer, pero **sí
+  avanzan el seq RTP**; al volver audio real, el jitter buffer veía esos seq como
+  "perdidos" y los rellenaba con **PLC fabricado** (audio inventado en los silencios
+  del emisor). *Fix:* `JitterBuffer` ahora distingue `Some(opus)`=audio vs
+  `None`=silencio; `rx_loop` pasa los relleno como `note_silence(seq)` → solo
+  mantienen la continuidad de seq, sin PLC. (compila + 11 tests OK).
+- ⚠️ **TX a verificar**: `WARN mic_buf vacío ~3s` al arrancar + `opus=33B` (≈silencio)
+  → o el usuario no hablaba (probable, con supresión de ruido), o problema de
+  captura/permiso. Necesita que el amigo confirme si SE LE OYÓ. Si no: revisar permiso
+  de micrófono de Windows y que el dispositivo capte voz (no silencio/comfort-noise).
+- 📌 build nuevo (con el fix) en `dist\discord-lite-new.exe` (el .exe estaba bloqueado
+  por la app abierta; renombrar tras cerrarla).
+
+## 🎯 ROADMAP — Optimización de sonido (abierto 2026-06-14)
+
+El objetivo de RAM YA está cumplido (22 MB vs 300–800 MB de Discord). La nueva
+frontera es **calidad de sonido y resiliencia de paquetes**. Metas en orden de
+impacto. Marcar `[x]` al cerrar cada una.
+
+- [x] **Meta 1 — Jitter buffer + PLC + FEC (RX).** ✅ HECHO 2026-06-14 (compila +
+  4 tests OK; pendiente verificación EN VIVO con 2ª persona). Era la causa real de
+  "fallan paquetes"/audio entrecortado: `rx_loop` decodificaba en orden de llegada.
+  - Nuevo `struct JitterBuffer` por SSRC en `voice.rs` (antes de `rx_loop`):
+    `HashMap<u16,Vec<u8>>` seq→Opus + cursor `next` + `Decoder` propio. Reordena por
+    seq RTP, mantiene cojín `DEPTH=3` (~60 ms), resync si el hueco supera `MAX=24`.
+  - PLC: en un hueco sin paquete siguiente, `decode(None::<&[u8]>, …)`.
+  - FEC: si el paquete N+1 llegó, `decode(Some(N+1), fec=true)` reconstruye el N
+    perdido antes de decodificar N+1 normal.
+  - `rx_loop`: `decoders` → `jitters`; extrae `seq` del header RTP (`packet[2..4]`);
+    nuevo contador `concealados` en el reporte RX (frames recuperados por PLC/FEC).
+- [x] **Meta 2 — Afinar Opus (TX).** ✅ HECHO 2026-06-14. Tras crear el `Encoder`
+  en `voice.rs`: `set_inband_fec(true)` + `set_packet_loss_perc(10)` +
+  `set_bitrate(BitsPerSecond(64_000))`. Cada uno con warn no-fatal si el backend
+  lo rechaza. Es lo que da el FEC que el RX (Meta 1) aprovecha.
+- [x] **Meta 3 — Remuestreo.** ✅ HECHO 2026-06-14 (compila + 8 tests OK; pendiente
+  probar en un dispositivo NO-48 kHz real). Decisión: en vez de `rubato` se hizo un
+  **resampler cúbico (Hermite/Catmull-Rom) propio en `audio.rs`** — CERO dependencias
+  nuevas, encaja con los callbacks de tamaño variable de cpal y mantiene el binario
+  diminuto. Detalles:
+  - `struct Resampler` (estéreo, streaming): 3 muestras de historia por canal +
+    posición fraccionaria entre llamadas; `process(input, &mut out)`. Con `step==1.0`
+    es passthrough EXACTO, pero solo se instancia si las frecuencias difieren.
+  - Entrada: `feed_input` remuestrea nativo→48 kHz si el micro no es 48 kHz; si lo es,
+    es la ruta probada `push_input_i16` sin cambios.
+  - Salida: `drain_output` remuestrea 48 kHz→nativo (buffer `native` + chunks); si la
+    salida es 48 kHz, delega en `fill_output` (ruta probada). La envolvente anti-eco se
+    mide sobre el far-end a 48 kHz (antes de remuestrear).
+  - ⚠️ La ruta de 48 kHz (la del PC del usuario, WASAPI compartido) queda IDÉNTICA:
+    el remuestreo es puramente aditivo para dispositivos raros. 4 tests nuevos
+    (passthrough/DC, down/upsample, streaming en trozos).
+- [x] **Meta 4 — RNNoise mono + modos en UI.** ✅ HECHO 2026-06-14 (compila + 8
+  tests OK). Dos partes:
+  - **CPU a la mitad**: `Denoiser` ahora mezcla a MONO y corre UN solo `DenoiseState`
+    (antes uno por canal sobre señal idéntica), escribiendo el mono a ambos canales.
+  - **Modos estilo Discord**: nuevo enum `config::NoiseMode { Off, Light,
+    VoiceIsolation }` (serde snake_case + `from_u8`/`as_u8`). Reemplaza el bool
+    `noise_suppression`. `AudioOptions` guarda `noise_mode: AtomicU8` con
+    `noise_mode()`/`set_noise_mode()`. `VoiceProcessor::process` hace `match`:
+    Ligero→`NoiseGate` (revivido, ya no `dead_code`), Aislamiento→`Denoiser`, Off→nada.
+  - **UI**: en «Ajustes de voz», el checkbox de ruido pasó a un `menu::Choice` de 3
+    opciones (Desactivada / Ligera / Aislamiento de voz IA), aplicado en vivo + persistido.
+  - **Migración**: configs viejas sin `noise_mode` caen en `VoiceIsolation` (= el viejo
+    `noise_suppression=true`); el campo `noise_suppression` se ignora si aparece.
+- [~] **Meta 5 — AEC real (NLMS).** 🔨 INICIADA 2026-06-14: núcleo + fontanería +
+  opt-in HECHOS (compila + 11 tests OK, 3 nuevos del AEC). FALTA el ajuste fino en
+  vivo. NO reemplaza al ducker por defecto (sigue siendo el default; el AEC es opt-in).
+  - ✅ **Núcleo** `src/aec.rs`: filtro adaptativo **NLMS** mono (`struct Aec`) con
+    línea de retardo circular (sin memmove por muestra), **detector de doble-habla
+    (Geigel)** que congela la adaptación cuando domina la voz cercana, y `process()`
+    estéreo (mezcla a mono, resta eco, escribe a ambos canales). Verificado con tests
+    offline: convergencia **ERLE >20 dB** con eco sintético, passthrough sin referencia,
+    y protección de la voz cercana en doble-habla.
+  - ✅ **Fontanería referencia far-end**: `AudioOptions` guarda `far_ref`
+    (ring mono 48 kHz, ~500 ms) + `aec_enabled`. La ruta de reproducción REAL
+    (`fill_output`/`drain_output`, `track_env`) la alimenta solo con AEC activo; el TX
+    la consume en lockstep (`take_far_ref(960)` por trama).
+  - ✅ **Opt-in**: `config.voice.aec` (default false) + checkbox «Cancelación de eco
+    avanzada (experimental)» en Ajustes de voz. `VoiceProcessor`: si `aec_enabled`
+    corre el AEC (en vez del ducker), misma posición en la cadena. `AEC_TAPS=2048`
+    (~43 ms de presupuesto de retardo).
+  - ⬜ **PENDIENTE (lo difícil, necesita 2ª persona en vivo):**
+    1. **Estimación/compensación de retardo**: el eco en el micro llega con un retardo
+       de pipeline (buffers SW+dispositivo) que puede SUPERAR los 43 ms del filtro. Si
+       el retardo cae fuera de `AEC_TAPS`, el AEC no cancela. Hace falta estimar D por
+       correlación cruzada far↔mic y alinear (o subir taps, con coste). ESTE es el
+       make-or-break.
+    2. **FDAF/PBFDAF** (con `rustfft`): filtros largos baratos en frecuencia (el
+       NLMS por muestra a 2048+ taps es costoso en CPU).
+    3. **Ajuste de `mu`/DTD/`AEC_TAPS`** con eco acústico real (sin auriculares).
+    4. Tras validar: evaluar hacerlo el default y jubilar el `EchoDucker`.
+
+### Notas de diseño Meta 1 (jitter buffer)
+- Estado por SSRC: `HashMap<u16,Vec<u8>>` (seq→Opus) + cursor `next: Option<u16>` +
+  `Decoder` + scratch PCM. Comparar seq con `seq_diff(a,b)=a.wrapping_sub(b) as i16`
+  (maneja el wrap de u16 en ventanas <32768).
+- DEPTH≈3 frames de cojín antes de empezar a emitir/concealar; MAX de seguridad
+  para no crecer sin límite. Descartar paquetes más viejos que `next` (tardíos).
+- `play_buf` (cpal output) sigue dando el reloj de reproducción y suaviza extra; el
+  jitter buffer SOLO reordena + rellena huecos. No tocar el código DAVE/E2EE.
+
+---
+
+## ⭐ ÚLTIMA SESIÓN (2026-06-10, parte 4) — ECO recursivo + RNNoise ("Krisp")
+
+**Síntomas reportados:** eco recursivo que afectaba a TODA la sala (no solo a una
+máquina). En el log: la sesión de voz cayó con `close 4006 "Session is no longer
+valid"` a las 23:46:23 pero el **TX siguió enviando frames 90 s más** (hasta el
+final del log).
+
+**Causa raíz 1 — hilo de audio zombi (bug claro):** en `voice.rs::session`, al
+terminar la sesión POR ERROR (p. ej. 4006) se retornaba el `Err` pero **nunca se
+ponía `shared.stop = true`**. Los hilos TX/RX (que tienen un clon del `Arc` stop)
+seguían vivos capturando micro y enviando UDP indefinidamente. Si el usuario se
+reconectaba, había **doble captura del micrófono** → audio duplicado para los
+demás = eco. *Fix:* guard `StopOnDrop` que pone `stop=true` en su `Drop` al salir
+de `session` por cualquier vía.
+
+**Causa raíz 2 — no había cancelación de eco real, y estaba apagada:** el
+"anti-eco" era un *ducker* de solo **-8 dB** y `echo_suppression` venía
+**desactivado por defecto** (se desactivó en la parte 3 porque robotizaba). Sin
+auriculares, el micro recapta la voz de la sala y la reenvía a -8 dB → audible →
+eco recursivo. *Fix:* `EchoDucker` reescrito (ver abajo) y `echo_suppression=true`
+por defecto.
+
+**RNNoise = el "Krisp" abierto (lo que pidió el usuario):** Krisp es propietario
+(Discord lo licencia, no se puede empaquetar). WebRTC APM tampoco: es C++ con
+abseil, **inviable con el toolchain GNU** (ya costó precompilar libopus.a a mano).
+El equivalente abierto es **RNNoise**, y `nnnoiseless` es un port en **Rust PURO**
+que compila sin libs C. Integrado como `audio::Denoiser` (supresión de ruido /
+aislamiento de voz por red neuronal).
+
+**Cambios concretos:**
+- `Cargo.toml`: + `nnnoiseless = { version = "0.5", default-features = false }`.
+- `voice.rs`: guard `StopOnDrop` mata los hilos de audio al caer la sesión.
+- `audio.rs`:
+  - `Denoiser` (RNNoise): procesa estéreo en bloques mono de 480 (10 ms), un
+    `DenoiseState` por canal; expone `vad()` (prob. de voz).
+  - `EchoDucker` reescrito: floor **0.05 (-26 dB)**, ataque 0.3 / liberación 0.08,
+    y **hangover de voz `SPEAK_HOLD=15` (~300 ms)** → solo atenúa ECO PURO (usuario
+    callado), nunca a mitad de palabra. Esto evita la robotización de la parte 3
+    mientras sí mata el eco. `coupling` arranca bajo (0.15) para no tocar a quien
+    usa auriculares.
+  - `VoiceProcessor`: cadena nueva = gain → anti-eco → RNNoise → AGC (medidor al
+    final). `NoiseGate` queda como alternativa ligera (`#[allow(dead_code)]`).
+- `config.rs`: `echo_suppression=true` por defecto; `noise_suppression` ahora es
+  RNNoise.
+
+**PENDIENTE / a validar con 2+ personas reales en llamada:**
+- Afinar `DUCK_FLOOR`/`SPEAK_HOLD`/umbral de `speaking` con eco real sin
+  auriculares (no se pudo probar en vivo en esta sesión).
+- AEC *real* (resta de referencia, no ducking) sería lo ideal para doble-habla
+  limpio: requiere FDAF/NLMS en Rust (rustfft) con alineación de la referencia
+  far-end, o cambiar a toolchain MSVC para usar `webrtc-audio-processing`.
+- (Opcional) Exponer en la UI modos tipo Discord: Off / Ligero (NoiseGate) /
+  Aislamiento de voz (RNNoise).
+- (Opcional) Auto-reconexión de voz tras 4006 en `net.rs` (hoy es manual).
+
+## ÚLTIMA SESIÓN (2026-06-10, parte 3) — ARREGLO: la voz salía ROBOTIZADA (v0.2.1)
 
 Tras v0.2.0 la voz salía **robótica/entrecortada** y «saturaba» el canal (los
 demás también se oían mal). **Causa raíz:** el procesado nuevo aplicaba al micro

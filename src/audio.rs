@@ -8,10 +8,12 @@
 //! bloquear. Cambiar de dispositivo incrementa `device_generation`; los hilos
 //! de audio lo detectan y reconstruyen sus streams sin cortar la llamada.
 
+use crate::config::NoiseMode;
 use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use nnnoiseless::DenoiseState;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -31,8 +33,9 @@ pub struct AudioOptions {
     output_volume: AtomicU32,
     /// Cancelación de eco (ducking del micro mientras suena la voz remota).
     pub echo_suppress: AtomicBool,
-    /// Supresión de ruido (puerta de ruido adaptativa).
-    pub noise_suppress: AtomicBool,
+    /// Modo de supresión de ruido (0=Off, 1=Ligero/puerta, 2=Aislamiento/RNNoise).
+    /// Privado: se accede con `noise_mode()`/`set_noise_mode()`.
+    noise_mode: AtomicU8,
     /// Control automático de ganancia (sube los micros que se oyen bajos).
     pub agc: AtomicBool,
     /// Sensibilidad de entrada automática (la puerta aprende el piso de ruido).
@@ -49,6 +52,12 @@ pub struct AudioOptions {
     output_device: Mutex<Option<String>>,
     /// Se incrementa al cambiar de dispositivo; los hilos de audio reabren streams.
     device_generation: AtomicU64,
+    /// Cancelación de eco avanzada (AEC NLMS, Meta 5). EXPERIMENTAL/opt-in.
+    aec_enabled: AtomicBool,
+    /// Referencia far-end (mono, 48 kHz) para el AEC: lo que se reproduce por el
+    /// altavoz. La ruta de reproducción REAL la alimenta; el TX la consume en
+    /// lockstep con el micro. Solo se acumula si el AEC está activo.
+    far_ref: Mutex<VecDeque<f32>>,
 }
 
 impl AudioOptions {
@@ -57,7 +66,7 @@ impl AudioOptions {
             input_volume: AtomicU32::new(100),
             output_volume: AtomicU32::new(100),
             echo_suppress: AtomicBool::new(true),
-            noise_suppress: AtomicBool::new(true),
+            noise_mode: AtomicU8::new(NoiseMode::VoiceIsolation.as_u8()),
             agc: AtomicBool::new(true),
             auto_sensitivity: AtomicBool::new(true),
             sensitivity_db: AtomicI32::new(-60),
@@ -66,6 +75,8 @@ impl AudioOptions {
             input_device: Mutex::new(None),
             output_device: Mutex::new(None),
             device_generation: AtomicU64::new(0),
+            aec_enabled: AtomicBool::new(false),
+            far_ref: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -80,6 +91,39 @@ impl AudioOptions {
     }
     pub fn set_output_volume(&self, pct: u32) {
         self.output_volume.store(pct.min(200), Ordering::Relaxed);
+    }
+
+    pub fn noise_mode(&self) -> NoiseMode {
+        NoiseMode::from_u8(self.noise_mode.load(Ordering::Relaxed))
+    }
+    pub fn set_noise_mode(&self, m: NoiseMode) {
+        self.noise_mode.store(m.as_u8(), Ordering::Relaxed);
+    }
+
+    pub fn aec_enabled(&self) -> bool {
+        self.aec_enabled.load(Ordering::Relaxed)
+    }
+    pub fn set_aec(&self, on: bool) {
+        self.aec_enabled.store(on, Ordering::Relaxed);
+        if !on {
+            self.far_ref.lock().unwrap().clear(); // no acumular si está apagado
+        }
+    }
+    /// La ruta de reproducción real empuja aquí el far-end (mono 48 kHz). Solo
+    /// acumula con el AEC activo; acota a ~500 ms para no crecer sin límite.
+    pub fn push_far_ref(&self, mono: &[f32]) {
+        if !self.aec_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut q = self.far_ref.lock().unwrap();
+        q.extend(mono.iter().copied());
+        cap_f32(&mut q, SAMPLE_RATE as usize / 2);
+    }
+    /// El TX toma `n` muestras de referencia alineadas con la trama del micro
+    /// (rellena con silencio si aún no hay suficientes).
+    pub fn take_far_ref(&self, n: usize) -> Vec<f32> {
+        let mut q = self.far_ref.lock().unwrap();
+        (0..n).map(|_| q.pop_front().unwrap_or(0.0)).collect()
     }
 
     pub fn sensitivity_db(&self) -> f32 {
@@ -143,8 +187,9 @@ pub fn apply_settings(v: &crate::config::VoiceSettings) {
     o.set_input_volume(v.input_volume);
     o.set_output_volume(v.output_volume);
     o.echo_suppress.store(v.echo_suppression, Ordering::Relaxed);
-    o.noise_suppress.store(v.noise_suppression, Ordering::Relaxed);
+    o.set_noise_mode(v.noise_mode);
     o.agc.store(v.auto_gain, Ordering::Relaxed);
+    o.set_aec(v.aec);
     o.auto_sensitivity.store(v.auto_sensitivity, Ordering::Relaxed);
     o.set_sensitivity_db(v.sensitivity_db);
     o.set_input_device(v.input_device.clone());
@@ -189,6 +234,100 @@ pub fn cap(b: &mut VecDeque<i16>, max: usize) {
     }
 }
 
+/// Igual que `cap` para la referencia far-end del AEC (muestras f32).
+fn cap_f32(b: &mut VecDeque<f32>, max: usize) {
+    while b.len() > max {
+        b.pop_front();
+    }
+}
+
+// --- Remuestreo (Meta 3) -----------------------------------------------------
+
+/// Interpolación cúbica de 4 puntos (Catmull-Rom) entre `x0` y `x1` en `t∈[0,1)`,
+/// usando los vecinos `xm1`/`x2`. Mejor que la lineal para voz (menos aliasing).
+fn hermite4(xm1: f32, x0: f32, x1: f32, x2: f32, t: f32) -> f32 {
+    let c1 = 0.5 * (x1 - xm1);
+    let c2 = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
+    let c3 = 0.5 * (x2 - xm1) + 1.5 * (x0 - x1);
+    ((c3 * t + c2) * t + c1) * t + x0
+}
+
+/// Remuestreador estéreo en streaming (cúbico). Convierte entre la frecuencia
+/// nativa de un dispositivo y los 48 kHz del pipeline interno cuando el
+/// dispositivo NO ofrece 48 kHz en modo compartido (antes la voz salía a tono
+/// incorrecto). Es puro Rust, sin dependencias, y procesa chunks de tamaño
+/// arbitrario (los callbacks de cpal varían): mantiene 3 muestras de historia por
+/// canal y una posición fraccionaria entre llamadas. Con `step==1.0` es un
+/// passthrough EXACTO, pero solo se instancia cuando las frecuencias difieren.
+pub struct Resampler {
+    step: f64,        // muestras de ENTRADA consumidas por muestra de SALIDA
+    pos: f64,         // posición de lectura (coords del array [historia(3) ++ entrada])
+    hist_l: [f32; 3], // últimas 3 muestras de entrada (canal izq) de la llamada previa
+    hist_r: [f32; 3],
+}
+
+impl Resampler {
+    pub fn new(src_rate: u32, dst_rate: u32) -> Self {
+        Self {
+            step: src_rate as f64 / dst_rate as f64,
+            pos: 3.0, // arranca en la primera muestra real (índices 0..3 = historia)
+            hist_l: [0.0; 3],
+            hist_r: [0.0; 3],
+        }
+    }
+
+    /// Lee la muestra del array virtual `historia(3) ++ entrada` (estéreo i16
+    /// intercalado) en el índice `idx`, canal `ch` (0=izq, 1=der).
+    #[inline]
+    fn at(&self, input: &[i16], idx: usize, ch: usize) -> f32 {
+        if idx < 3 {
+            if ch == 0 { self.hist_l[idx] } else { self.hist_r[idx] }
+        } else {
+            input[(idx - 3) * CHANNELS + ch] as f32
+        }
+    }
+
+    /// Procesa un chunk de entrada estéreo intercalado (a la frecuencia nativa) y
+    /// añade a `out` las muestras estéreo i16 resultantes (a la de destino).
+    pub fn process(&mut self, input: &[i16], out: &mut VecDeque<i16>) {
+        let n = input.len() / CHANNELS;
+        if n == 0 {
+            return;
+        }
+        let last = 3 + n - 1; // último índice válido del array virtual
+        loop {
+            let i = self.pos.floor();
+            let ii = i as usize;
+            // Necesitamos los vecinos ii-1 .. ii+2 dentro de rango.
+            if ii < 1 || ii + 2 > last {
+                break;
+            }
+            let t = (self.pos - i) as f32;
+            for ch in 0..CHANNELS {
+                let y = hermite4(
+                    self.at(input, ii - 1, ch),
+                    self.at(input, ii, ch),
+                    self.at(input, ii + 1, ch),
+                    self.at(input, ii + 2, ch),
+                    t,
+                );
+                out.push_back(y.clamp(-32768.0, 32767.0) as i16);
+            }
+            self.pos += self.step;
+        }
+        // Nueva historia = las últimas 3 muestras del array virtual; desplaza el
+        // marco de coordenadas en `n` (las muestras de entrada ya consumidas).
+        let (mut nl, mut nr) = ([0.0f32; 3], [0.0f32; 3]);
+        for k in 0..3 {
+            nl[k] = self.at(input, n + k, 0);
+            nr[k] = self.at(input, n + k, 1);
+        }
+        self.hist_l = nl;
+        self.hist_r = nr;
+        self.pos -= n as f64;
+    }
+}
+
 // --- Procesamiento de voz (TX) ----------------------------------------------
 
 /// Puerta de ruido para suprimir el hiss constante del micrófono cuando no se
@@ -196,6 +335,9 @@ pub fn cap(b: &mut VecDeque<i16>, max: usize) {
 /// y abre solo cuando el RMS lo supera por margen; en manual usa el umbral del
 /// slider de sensibilidad. Con histéresis y envolvente (ataque rápido,
 /// liberación lenta) para no producir clics ni cortar el final de las palabras.
+///
+/// Es el modo **Ligero** del selector de supresión de ruido (sin red neuronal):
+/// más barato en CPU que `Denoiser` (RNNoise), útil en equipos justos de recursos.
 pub struct NoiseGate {
     gain: f32,        // ganancia actual aplicada (0..1), suavizada
     hold: u32,        // tramas restantes manteniendo la puerta abierta
@@ -272,23 +414,41 @@ impl Agc {
     }
 }
 
-/// Cancelación de eco por atenuación (ducking): mientras suena la voz de otros
-/// por los altavoces, atenúa el micrófono salvo que el usuario esté hablando por
-/// encima del eco esperado. Aprende el acople acústico altavoz→micro (ratio RMS)
-/// para no atenuar durante el doble-habla.
+/// Supresión de eco por atenuación (ducking): mientras suena la voz de otros por
+/// los altavoces, atenúa FUERTE el micrófono salvo que el usuario esté hablando
+/// por encima del eco esperado. Aprende el acople acústico altavoz→micro (ratio
+/// RMS) para distinguir el eco de la voz real (doble-habla).
 ///
-/// CLAVE para no «robotizar»: el factor de atenuación se mueve MUY despacio entre
-/// tramas (constantes de tiempo de ~100–300 ms) y la atenuación mínima es modesta
-/// (-9 dB). Una atenuación fuerte que conmuta trama a trama modula la amplitud de
-/// la voz y produce el efecto robótico/entrecortado; aquí se evita a propósito.
+/// No es una cancelación adaptativa real (AEC tipo WebRTC/Krisp, que resta la
+/// señal de referencia muestra a muestra); es supresión: cuando el micro solo
+/// contiene eco lo baja ~-26 dB para que NO se reenvíe a la sala. La supresión de
+/// ruido por red neuronal posterior (RNNoise) limpia el residuo y suaviza la
+/// transición, evitando el efecto «robótico» que tenía el ducking suave anterior.
+///
+/// Ataque rápido (corta el eco en ~2-3 tramas) y liberación más lenta (no recorta
+/// el final de las palabras del usuario). `coupling` arranca bajo para no atenuar
+/// a quien usa auriculares (sin eco real) y sube solo si detecta acople verdadero.
 pub struct EchoDucker {
-    coupling: f32, // eco_en_micro ≈ coupling · rms_reproducido (aprendido)
-    duck: f32,     // atenuación actual aplicada (suavizada)
+    coupling: f32,   // eco_en_micro ≈ coupling · rms_reproducido (aprendido)
+    duck: f32,       // atenuación actual aplicada (suavizada)
+    speak_hold: u32, // tramas restantes considerando "el usuario habla" (anti-flicker)
 }
 
 impl EchoDucker {
+    /// Atenuación máxima del eco (≈ -26 dB). Suficiente para que el eco recaptado
+    /// no sea audible al reenviarse, sin llegar al mute total (que cortaría al
+    /// usuario si la detección de doble-habla falla un instante).
+    const DUCK_FLOOR: f32 = 0.05;
+    /// Hangover de voz: tras detectar que el usuario habla, se le considera
+    /// hablando ~300 ms más (15 tramas a 50/s). CLAVE contra la «robotización»:
+    /// evita que la atenuación entre a mitad de palabra si el RMS baja un instante
+    /// (la regresión de v0.2.0 era el duck parpadeando DURANTE la voz del usuario).
+    const SPEAK_HOLD: u32 = 15;
+
     pub fn new() -> Self {
-        Self { coupling: 0.5, duck: 1.0 }
+        // `coupling` bajo de inicio: con auriculares no hay eco y así no se atenúa
+        // la voz del usuario; sube solo si aparece acople acústico real.
+        Self { coupling: 0.15, duck: 1.0, speak_hold: 0 }
     }
 
     /// `far_rms` debe ser la envolvente YA suavizada de la reproducción
@@ -297,17 +457,26 @@ impl EchoDucker {
         let far_active = far_rms > 250.0;
         if far_active {
             let ratio = (mic_rms / far_rms.max(1.0)).min(4.0);
-            // Aprende el acople despacio (persigue el mínimo para quedarse con el
-            // eco, no con la voz del usuario superpuesta).
+            // Aprende el acople persiguiendo el MÍNIMO (baja rápido, sube despacio):
+            // así se queda con el nivel del eco puro, no con la voz superpuesta.
             let a = if ratio < self.coupling { 0.05 } else { 0.003 };
             self.coupling += (ratio - self.coupling) * a;
         }
         let expected_echo = self.coupling * far_rms;
-        let speaking = mic_rms > (expected_echo * 2.0).max(800.0);
-        // Atenuación máxima moderada (0.4 ≈ -8 dB) y SIEMPRE suavizada despacio,
-        // para reducir el eco sin recortar la voz a trozos.
-        let target = if far_active && !speaking { 0.4 } else { 1.0 };
-        let coeff = if target < self.duck { 0.08 } else { 0.04 };
+        // El usuario habla si su nivel supera con margen el eco esperado (factor
+        // 1.6) o un suelo absoluto (voz normal). Con hangover para no parpadear.
+        if mic_rms > (expected_echo * 1.6).max(800.0) {
+            self.speak_hold = Self::SPEAK_HOLD;
+        } else if self.speak_hold > 0 {
+            self.speak_hold -= 1;
+        }
+        // Solo se atenúa cuando suena la voz remota Y el usuario NO habla: es eco
+        // puro, sin voz propia que modular → atenuar fuerte aquí no robotiza nada.
+        let echo_only = far_active && self.speak_hold == 0;
+        let target = if echo_only { Self::DUCK_FLOOR } else { 1.0 };
+        // Ataque moderado (baja en ~200 ms) / liberación suave: la rampa cae sobre
+        // eco (no sobre voz), así que no introduce modulación audible de la voz.
+        let coeff = if target < self.duck { 0.3 } else { 0.08 };
         self.duck += (target - self.duck) * coeff;
         if self.duck < 0.999 {
             apply_gain(pcm, self.duck);
@@ -315,18 +484,88 @@ impl EchoDucker {
     }
 }
 
-/// Cadena completa de procesamiento del micrófono, en el orden:
-/// volumen de entrada → AGC → anti-eco → puerta de ruido. Publica el nivel
-/// resultante para el medidor de la UI. Cada paso respeta su toggle en vivo.
+/// Supresión de ruido / «aislamiento de voz» por red neuronal (RNNoise, port en
+/// Rust puro `nnnoiseless`). Es el equivalente abierto a la tecnología de Krisp
+/// que usa Discord: separa la voz del ruido de fondo (teclado, ventilador, calle)
+/// mucho mejor que una puerta de ruido por umbral, y sin cortar la voz.
+///
+/// RNNoise trabaja en tramas MONO de 480 muestras (10 ms) a 48 kHz. La voz es
+/// mono (el micro se duplica a ambos canales en captura), así que **mezclamos a
+/// mono**, procesamos con UN solo `DenoiseState` y escribimos el resultado a
+/// ambos canales. Antes se corría una red por canal (doble CPU) sobre una señal
+/// idéntica: a la mitad de coste, ideal para equipos justos de recursos. Devuelve
+/// además una probabilidad de voz (VAD) por trama, útil como medidor/indicador.
+pub struct Denoiser {
+    state: Box<DenoiseState<'static>>,
+    last_vad: f32,
+}
+
+impl Denoiser {
+    pub fn new() -> Self {
+        Self { state: DenoiseState::new(), last_vad: 0.0 }
+    }
+
+    /// Probabilidad de voz (0..1) estimada en la última trama procesada.
+    #[allow(dead_code)]
+    pub fn vad(&self) -> f32 {
+        self.last_vad
+    }
+
+    /// Procesa una trama PCM estéreo intercalada in situ. La longitud debe ser
+    /// múltiplo de `FRAME_SIZE * CHANNELS`; cualquier resto se deja sin tocar.
+    pub fn process(&mut self, pcm: &mut [i16]) {
+        const N: usize = DenoiseState::FRAME_SIZE; // 480 (10 ms a 48 kHz)
+        let mut inb = [0f32; N];
+        let mut outb = [0f32; N];
+        let per_ch = pcm.len() / CHANNELS;
+        let mut vad = 0.0f32;
+        let mut off = 0;
+        while off + N <= per_ch {
+            for i in 0..N {
+                let l = pcm[(off + i) * CHANNELS] as f32;
+                let r = pcm[(off + i) * CHANNELS + 1] as f32;
+                inb[i] = 0.5 * (l + r); // mezcla a mono
+            }
+            // RNNoise espera/devuelve f32 en rango i16 (no normalizado a ±1).
+            vad = vad.max(self.state.process_frame(&mut outb, &inb));
+            for i in 0..N {
+                let s = outb[i].clamp(-32768.0, 32767.0) as i16;
+                pcm[(off + i) * CHANNELS] = s; // mismo mono a ambos canales
+                pcm[(off + i) * CHANNELS + 1] = s;
+            }
+            off += N;
+        }
+        self.last_vad = vad;
+    }
+}
+
+/// Cadena completa de procesamiento del micrófono, en el orden recomendado para
+/// telefonía: volumen de entrada → anti-eco → supresión de ruido (RNNoise) →
+/// AGC. Hacer el anti-eco ANTES de la supresión de ruido evita reenviar la voz
+/// de otros; hacer el AGC AL FINAL evita amplificar ruido ya suprimido. Publica
+/// el nivel resultante para el medidor de la UI. Cada paso respeta su toggle.
 pub struct VoiceProcessor {
-    gate: NoiseGate,
     agc: Agc,
     ducker: EchoDucker,
+    denoiser: Denoiser,
+    gate: NoiseGate,
+    aec: crate::aec::Aec,
 }
 
 impl VoiceProcessor {
+    /// Longitud del filtro AEC (≈43 ms a 48 kHz): presupuesto de retardo+reverb
+    /// que puede cancelar. Si el retardo del pipeline lo supera, hay que subirlo
+    /// (o pasar a FDAF para que filtros más largos sean baratos) — pendiente Meta 5.
+    const AEC_TAPS: usize = 2048;
+
     pub fn new() -> Self {
-        Self { gate: NoiseGate::new(), agc: Agc::new(), ducker: EchoDucker::new() }
+        Self {
+            agc: Agc::new(),
+            ducker: EchoDucker::new(),
+            denoiser: Denoiser::new(),
+            gate: NoiseGate::new(),
+            aec: crate::aec::Aec::new(Self::AEC_TAPS),
+        }
     }
 
     pub fn process(&mut self, pcm: &mut [i16]) {
@@ -335,15 +574,27 @@ impl VoiceProcessor {
         if (g - 1.0).abs() > 0.001 {
             apply_gain(pcm, g);
         }
-        if o.agc.load(Ordering::Relaxed) {
-            self.agc.process(pcm);
-        }
-        if o.echo_suppress.load(Ordering::Relaxed) {
+        // Etapa anti-eco. Con AEC avanzado (opt-in) RESTA el eco usando la
+        // referencia far-end alineada (permite doble-habla); si no, el ducker
+        // básico ATENÚA el micro mientras suena la voz remota. Misma posición en
+        // la cadena (antes de la supresión de ruido).
+        if o.aec_enabled() {
+            let frames = pcm.len() / CHANNELS;
+            let far = o.take_far_ref(frames);
+            self.aec.process(pcm, &far);
+        } else if o.echo_suppress.load(Ordering::Relaxed) {
             let r = rms(pcm);
             self.ducker.process(pcm, r, o.out_env());
         }
-        if o.noise_suppress.load(Ordering::Relaxed) {
-            self.gate.process(pcm);
+        // Supresión de ruido según el modo elegido (estilo Discord):
+        //   Ligero = puerta de ruido por umbral; Aislamiento = RNNoise (IA).
+        match o.noise_mode() {
+            NoiseMode::Light => self.gate.process(pcm),
+            NoiseMode::VoiceIsolation => self.denoiser.process(pcm),
+            NoiseMode::Off => {}
+        }
+        if o.agc.load(Ordering::Relaxed) {
+            self.agc.process(pcm);
         }
         o.set_mic_level(rms_to_pct(rms(pcm)));
     }
@@ -449,20 +700,23 @@ pub fn build_input_stream(buf: Arc<Mutex<VecDeque<i16>>>) -> Result<cpal::Stream
         ch,
         cfg.sample_format()
     );
-    if cfg.sample_rate().0 != SAMPLE_RATE {
-        tracing::warn!(
-            "⚠️ el micrófono no soporta 48 kHz (usa {}) y NO hay remuestreo: \
-             la voz sonará a velocidad/tono incorrecto",
-            cfg.sample_rate().0
-        );
+    let src_rate = cfg.sample_rate().0;
+    if src_rate != SAMPLE_RATE {
+        tracing::info!("audio in: remuestreando {src_rate}→{SAMPLE_RATE} Hz (cúbico)");
     }
+    // Resampler solo si el dispositivo NO da 48 kHz; en 48 kHz la ruta es idéntica
+    // a la versión probada (sin tocar nada). `tmp` reusa memoria entre callbacks.
+    let mut rs = (src_rate != SAMPLE_RATE).then(|| Resampler::new(src_rate, SAMPLE_RATE));
+    let mut tmp: Vec<i16> = Vec::new();
     let err_fn = |e| tracing::warn!("error stream entrada: {e}");
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => dev.build_input_stream(
             &cfg.config(),
             move |data: &[f32], _: &_| {
                 let mut b = buf.lock().unwrap();
-                push_input_i16(&mut b, data, ch, |s| (s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                feed_input(&mut b, data, ch, &mut rs, &mut tmp, |s| {
+                    (s.clamp(-1.0, 1.0) * 32767.0) as i16
+                });
                 cap(&mut b, SAMPLE_RATE as usize * CHANNELS); // ~1 s máx
             },
             err_fn,
@@ -472,7 +726,7 @@ pub fn build_input_stream(buf: Arc<Mutex<VecDeque<i16>>>) -> Result<cpal::Stream
             &cfg.config(),
             move |data: &[i16], _: &_| {
                 let mut b = buf.lock().unwrap();
-                push_input_i16(&mut b, data, ch, |s| s);
+                feed_input(&mut b, data, ch, &mut rs, &mut tmp, |s| s);
                 cap(&mut b, SAMPLE_RATE as usize * CHANNELS);
             },
             err_fn,
@@ -501,17 +755,31 @@ pub fn build_output_stream(
         ch,
         cfg.sample_format()
     );
+    let dst_rate = cfg.sample_rate().0;
+    if dst_rate != SAMPLE_RATE {
+        tracing::info!("audio out: remuestreando {SAMPLE_RATE}→{dst_rate} Hz (cúbico)");
+    }
+    // El pipeline interno es 48 kHz; si la salida no lo es, remuestrea 48 kHz→nativo.
+    // En 48 kHz (`rs=None`) la ruta es idéntica a la versión probada. `native`
+    // acumula muestras ya remuestreadas y `tmp` reusa memoria entre callbacks.
+    let make_rs = move || (dst_rate != SAMPLE_RATE).then(|| Resampler::new(SAMPLE_RATE, dst_rate));
     let err_fn = |e| tracing::warn!("error stream salida: {e}");
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => {
             let deaf = deaf.clone();
+            let mut rs = make_rs();
+            let mut native: VecDeque<i16> = VecDeque::new();
+            let mut tmp: Vec<i16> = Vec::new();
             dev.build_output_stream(
                 &cfg.config(),
                 move |data: &mut [f32], _: &_| {
                     let silent = deaf.as_ref().map(|d| d.load(Ordering::Relaxed)).unwrap_or(false);
                     let gain = options().output_gain();
                     let mut b = buf.lock().unwrap();
-                    fill_output(data, &mut b, ch, silent, gain, track_env, |s| s as f32 / 32767.0);
+                    drain_output(
+                        data, &mut b, ch, silent, gain, track_env, &mut rs, &mut native,
+                        &mut tmp, |s| s as f32 / 32767.0,
+                    );
                 },
                 err_fn,
                 None,
@@ -519,13 +787,19 @@ pub fn build_output_stream(
         }
         cpal::SampleFormat::I16 => {
             let deaf = deaf.clone();
+            let mut rs = make_rs();
+            let mut native: VecDeque<i16> = VecDeque::new();
+            let mut tmp: Vec<i16> = Vec::new();
             dev.build_output_stream(
                 &cfg.config(),
                 move |data: &mut [i16], _: &_| {
                     let silent = deaf.as_ref().map(|d| d.load(Ordering::Relaxed)).unwrap_or(false);
                     let gain = options().output_gain();
                     let mut b = buf.lock().unwrap();
-                    fill_output(data, &mut b, ch, silent, gain, track_env, |s| s);
+                    drain_output(
+                        data, &mut b, ch, silent, gain, track_env, &mut rs, &mut native,
+                        &mut tmp, |s| s,
+                    );
                 },
                 err_fn,
                 None,
@@ -534,6 +808,35 @@ pub fn build_output_stream(
         other => bail!("formato de salida no soportado: {other:?}"),
     };
     Ok(stream)
+}
+
+/// Normaliza un chunk del micrófono a estéreo i16 48 kHz y lo vuelca en `out`.
+/// Con `rs` activo (dispositivo no-48 kHz) remuestrea; si no, es exactamente la
+/// ruta probada `push_input_i16` (passthrough). `tmp` reusa memoria entre llamadas.
+fn feed_input<T: Copy>(
+    out: &mut VecDeque<i16>,
+    data: &[T],
+    in_ch: usize,
+    rs: &mut Option<Resampler>,
+    tmp: &mut Vec<i16>,
+    conv: impl Fn(T) -> i16,
+) {
+    if in_ch == 0 {
+        return;
+    }
+    match rs {
+        None => push_input_i16(out, data, in_ch, conv),
+        Some(r) => {
+            tmp.clear();
+            for frame in data.chunks(in_ch) {
+                let l = conv(frame[0]);
+                let rr = if in_ch >= 2 { conv(frame[1]) } else { l };
+                tmp.push(l);
+                tmp.push(rr);
+            }
+            r.process(tmp, out);
+        }
+    }
 }
 
 /// Inserta muestras del micrófono normalizadas a estéreo i16.
@@ -571,6 +874,10 @@ pub fn fill_output<T: Copy + Default>(
     let scale = (gain - 1.0).abs() > 0.001;
     let mut sumsq = 0.0f64;
     let mut count = 0usize;
+    // Solo en la llamada real (track_env) y con AEC activo, recoge el far-end mono
+    // para la cancelación de eco; en otro caso no hay coste.
+    let feed_aec = track_env && options().aec_enabled();
+    let mut far: Vec<f32> = Vec::new();
     for frame in data.chunks_mut(out_ch) {
         let (mut l, mut r) = if silent {
             (0i16, 0i16)
@@ -583,6 +890,9 @@ pub fn fill_output<T: Copy + Default>(
         }
         sumsq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
         count += 2;
+        if feed_aec {
+            far.push(0.5 * (l as f32 + r as f32));
+        }
         for (i, slot) in frame.iter_mut().enumerate() {
             *slot = match i {
                 0 => conv(l),
@@ -593,6 +903,90 @@ pub fn fill_output<T: Copy + Default>(
     }
     if track_env && count > 0 {
         options().update_out_env(((sumsq / count as f64) as f32).sqrt());
+    }
+    if feed_aec {
+        options().push_far_ref(&far);
+    }
+}
+
+/// Igual que `fill_output` pero remuestrea la fuente de 48 kHz a la frecuencia
+/// nativa de la salida cuando `rs` está activo. Sin `rs` (salida a 48 kHz) delega
+/// en `fill_output` (ruta idéntica a la probada). La envolvente del anti-eco se
+/// mide sobre la señal 48 kHz del far-end (antes de remuestrear), que es la
+/// correcta. `native` guarda lo ya remuestreado; `tmp` reusa un chunk de 48 kHz.
+#[allow(clippy::too_many_arguments)]
+pub fn drain_output<T: Copy + Default>(
+    data: &mut [T],
+    src: &mut VecDeque<i16>,
+    out_ch: usize,
+    silent: bool,
+    gain: f32,
+    track_env: bool,
+    rs: &mut Option<Resampler>,
+    native: &mut VecDeque<i16>,
+    tmp: &mut Vec<i16>,
+    conv: impl Fn(i16) -> T,
+) {
+    if out_ch == 0 {
+        return;
+    }
+    let r = match rs {
+        None => {
+            fill_output(data, src, out_ch, silent, gain, track_env, conv);
+            return;
+        }
+        Some(r) => r,
+    };
+    let frames_needed = data.len() / out_ch;
+    let mut sumsq = 0.0f64;
+    let mut count = 0usize;
+    // Referencia far-end para el AEC: se mide a 48 kHz (la fuente), antes de
+    // remuestrear, para que esté a la misma frecuencia que el micro.
+    let feed_aec = track_env && options().aec_enabled();
+    let mut far: Vec<f32> = Vec::new();
+    // Rellena `native` desde la fuente 48 kHz (en chunks) hasta cubrir la salida.
+    while native.len() < frames_needed * CHANNELS && src.len() >= CHANNELS {
+        tmp.clear();
+        for _ in 0..480 {
+            if src.len() < CHANNELS {
+                break;
+            }
+            let l = src.pop_front().unwrap();
+            let rr = src.pop_front().unwrap();
+            sumsq += (l as f64) * (l as f64) + (rr as f64) * (rr as f64);
+            count += 2;
+            if feed_aec {
+                far.push(0.5 * (l as f32 + rr as f32));
+            }
+            tmp.push(l);
+            tmp.push(rr);
+        }
+        r.process(tmp, native);
+    }
+    if track_env && count > 0 {
+        options().update_out_env(((sumsq / count as f64) as f32).sqrt());
+    }
+    if feed_aec {
+        options().push_far_ref(&far);
+    }
+    let scale = (gain - 1.0).abs() > 0.001;
+    for frame in data.chunks_mut(out_ch) {
+        let (mut l, mut rr) = if silent || native.len() < CHANNELS {
+            (0i16, 0i16)
+        } else {
+            (native.pop_front().unwrap(), native.pop_front().unwrap())
+        };
+        if scale {
+            l = ((l as f32) * gain).clamp(-32768.0, 32767.0) as i16;
+            rr = ((rr as f32) * gain).clamp(-32768.0, 32767.0) as i16;
+        }
+        for (i, slot) in frame.iter_mut().enumerate() {
+            *slot = match i {
+                0 => conv(l),
+                1 => conv(rr),
+                _ => T::default(),
+            };
+        }
     }
 }
 
@@ -672,4 +1066,68 @@ fn mic_test_thread(stop: Arc<AtomicBool>) -> Result<()> {
     }
     tracing::info!("prueba de micrófono detenida");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` frames estéreo intercalados con valor constante `v`.
+    fn stereo_const(n: usize, v: i16) -> Vec<i16> {
+        let mut x = Vec::with_capacity(n * CHANNELS);
+        for _ in 0..n {
+            x.push(v);
+            x.push(v);
+        }
+        x
+    }
+
+    #[test]
+    fn resampler_passthrough_preserves_dc() {
+        // step=1.0 (misma frecuencia): DC exacto y ~misma cantidad de frames.
+        let mut r = Resampler::new(48_000, 48_000);
+        let input = stereo_const(1000, 5000);
+        let mut out = VecDeque::new();
+        r.process(&input, &mut out);
+        let frames = out.len() / CHANNELS;
+        assert!((990..=1000).contains(&frames), "frames={frames}");
+        // El cúbico de una señal constante es la misma constante (sin deriva).
+        for &s in out.iter() {
+            assert!((s as i32 - 5000).abs() <= 1, "s={s}");
+        }
+    }
+
+    #[test]
+    fn resampler_downsample_halves_frames() {
+        let mut r = Resampler::new(48_000, 24_000); // step=2.0 → mitad de salida
+        let input = stereo_const(2000, 1000);
+        let mut out = VecDeque::new();
+        r.process(&input, &mut out);
+        let frames = out.len() / CHANNELS;
+        assert!((994..=1000).contains(&frames), "frames={frames}");
+    }
+
+    #[test]
+    fn resampler_upsample_doubles_frames() {
+        let mut r = Resampler::new(24_000, 48_000); // step=0.5 → doble de salida
+        let input = stereo_const(1000, 1000);
+        let mut out = VecDeque::new();
+        r.process(&input, &mut out);
+        let frames = out.len() / CHANNELS;
+        assert!((1992..=2000).contains(&frames), "frames={frames}");
+    }
+
+    #[test]
+    fn resampler_streaming_matches_rate() {
+        // 44.1→48 kHz procesado en muchos trozos pequeños: el total debe acercarse
+        // a la razón teórica (valida que el estado entre callbacks es correcto).
+        let mut r = Resampler::new(44_100, 48_000);
+        let mut out = VecDeque::new();
+        let chunk = stereo_const(441, 2000); // 10 ms a 44.1 kHz
+        for _ in 0..10 {
+            r.process(&chunk, &mut out);
+        }
+        let frames = out.len() / CHANNELS; // 4410 in → ~4800 out
+        assert!((4790..=4805).contains(&frames), "frames={frames}");
+    }
 }

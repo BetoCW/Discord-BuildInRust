@@ -7,6 +7,7 @@
 // para ver los logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod aec;
 mod applog;
 mod audio;
 mod auth;

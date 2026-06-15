@@ -16,6 +16,36 @@ pub struct VoiceTarget {
     pub channel_id: String,
 }
 
+/// Modo de supresión de ruido del micrófono, estilo Discord:
+/// - `Off`: sin procesar (la voz pasa tal cual).
+/// - `Light`: puerta de ruido por umbral (barata; silencia el fondo en silencios).
+/// - `VoiceIsolation`: red neuronal RNNoise (aísla la voz del ruido continuo;
+///   el equivalente abierto a «Krisp»). Más CPU, mejor resultado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseMode {
+    Off,
+    Light,
+    VoiceIsolation,
+}
+
+impl NoiseMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => NoiseMode::Off,
+            1 => NoiseMode::Light,
+            _ => NoiseMode::VoiceIsolation,
+        }
+    }
+    pub fn as_u8(self) -> u8 {
+        match self {
+            NoiseMode::Off => 0,
+            NoiseMode::Light => 1,
+            NoiseMode::VoiceIsolation => 2,
+        }
+    }
+}
+
 /// Ajustes de voz (panel «Ajustes de voz», estilo Discord). Se aplican en vivo
 /// vía `audio::options()` y se persisten aquí.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,18 +62,26 @@ pub struct VoiceSettings {
     /// Volumen de salida en % (0–200).
     #[serde(default = "default_volume")]
     pub output_volume: u32,
-    /// Cancelación de eco (atenúa el micro mientras suena la voz de otros).
-    /// Por defecto DESACTIVADA: solo hace falta sin auriculares, y al introducir
-    /// atenuación dependiente de la señal puede degradar la voz; es opt-in.
-    #[serde(default = "default_false")]
-    pub echo_suppression: bool,
-    /// Supresión de ruido (puerta de ruido). Es la cadena que ya funcionaba.
+    /// Supresión de eco (atenúa fuerte el micro mientras suena la voz de otros,
+    /// para no reenviarla a la sala). ACTIVADA por defecto: es lo que evita el
+    /// eco recursivo cuando alguien NO usa auriculares. A quien sí los usa no le
+    /// afecta (sin acople acústico, el ducker no atenúa la voz).
     #[serde(default = "default_true")]
-    pub noise_suppression: bool,
+    pub echo_suppression: bool,
+    /// Modo de supresión de ruido: Off / Ligero (puerta) / Aislamiento de voz
+    /// (RNNoise). Por defecto, aislamiento de voz (lo que hacía `noise_suppression`
+    /// = true antes). Configs viejas sin este campo migran a este predeterminado.
+    #[serde(default = "default_noise_mode")]
+    pub noise_mode: NoiseMode,
     /// Control automático de ganancia (sube los micros que se oyen bajos).
     /// Opt-in: cambia el volumen de forma dinámica y conviene probarlo antes.
     #[serde(default = "default_false")]
     pub auto_gain: bool,
+    /// Cancelación de eco AVANZADA (AEC adaptativo NLMS, Meta 5). EXPERIMENTAL y
+    /// opt-in: resta el eco en vez de atenuar (permite doble-habla), pero requiere
+    /// ajuste de retardo en vivo. Cuando está activa, sustituye al ducker básico.
+    #[serde(default = "default_false")]
+    pub aec: bool,
     /// Sensibilidad de entrada automática.
     #[serde(default = "default_true")]
     pub auto_sensitivity: bool,
@@ -59,9 +97,10 @@ impl Default for VoiceSettings {
             output_device: None,
             input_volume: default_volume(),
             output_volume: default_volume(),
-            echo_suppression: false,
-            noise_suppression: true,
+            echo_suppression: true,
+            noise_mode: default_noise_mode(),
             auto_gain: false,
+            aec: false,
             auto_sensitivity: true,
             sensitivity_db: default_sensitivity(),
         }
@@ -98,6 +137,10 @@ fn default_volume() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_noise_mode() -> NoiseMode {
+    NoiseMode::VoiceIsolation
 }
 
 fn default_false() -> bool {

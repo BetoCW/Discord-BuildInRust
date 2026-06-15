@@ -1,6 +1,6 @@
 [package]
 name = "discord-lite"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Cliente Discord nativo y ultraligero (uso personal): texto + voz"
 license = "MIT OR Apache-2.0"
@@ -38,6 +38,10 @@ cpal = "0.15"            # captura/reproducción (WASAPI en Windows)
 audiopus = "0.2"         # códec Opus (vendoriza libopus, build con CMake+gcc)
 chacha20poly1305 = "0.10" # cifrado de voz (aead_xchacha20_poly1305_rtpsize)
 byteorder = "1"          # encabezado RTP
+# Supresión de ruido / "aislamiento de voz" por red neuronal (RNNoise port en
+# Rust PURO: compila con el toolchain GNU sin libs C, a diferencia de WebRTC/Krisp).
+# Es el equivalente abierto a la tecnología que Discord licencia de Krisp.
+nnnoiseless = { version = "0.5", default-features = false }
 
 # --- DAVE (E2EE de voz): MLS RFC 9420 + cifrado de frames ---
 # (aes-gcm ya está declarado arriba; sirve también para los frames DAVE)
